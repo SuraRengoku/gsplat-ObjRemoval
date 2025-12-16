@@ -3,7 +3,7 @@
 import json
 import math
 import os
-import time
+import time 
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,112 +41,61 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
-
 @dataclass
 class Config:
-    # Disable viewer
     disable_viewer: bool = False
-    # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
-    # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
-    # Render trajectory path
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
-    # Downsample factor for the dataset
+    data_dir: str = "data/kitchen"
     data_factor: int = 4
-    # Directory to save results
-    result_dir: str = "results/garden"
-    # Every N images there is a test image
+    result_dir: str = "results/kitchen"
     test_every: int = 8
-    # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
-    # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
-    # Normalize the world space
     normalize_world_space: bool = True
-    # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
-    # Port for the viewer server
     port: int = 8080
 
-    # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
-    # A global factor to scale the number of training steps
-    steps_scaler: float = 1.0
+    steps_scalar: float = 1.0
 
-    # Number of training steps
     max_steps: int = 30_000
-    # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Whether to save ply file (storage size can be large)
     save_ply: bool = False
-    # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
-    ############################### for depth maps ####################################################
-
-    # Whether to save depth map for training images
-    save_train_depths: bool = False
-
-    ###################################################################################################
-
-    # Initialization strategy
     init_type: str = "sfm"
-    # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
-    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
-    # Degree of spherical harmonics
     sh_degree: int = 3
-    # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
-    # Initial opacity of GS
     init_opa: float = 0.1
-    # Initial scale of GS
     init_scale: float = 1.0
-    # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
-    # Near plane clipping distance
     near_plane: float = 0.01
-    # Far plane clipping distance
     far_plane: float = 1e10
 
-    # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
-    # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
-    # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
-    # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
-    # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
-    # Use random background for training to discourage transparency
     random_bkgd: bool = False
 
-    # LR for 3D point positions
     means_lr: float = 1.6e-4
-    # LR for Gaussian scale factors
     scales_lr: float = 5e-3
-    # LR for alpha blending weights
     opacities_lr: float = 5e-2
-    # LR for orientation (quaternions)
     quats_lr: float = 1e-3
-    # LR for SH band 0 (brightness)
     sh0_lr: float = 2.5e-3
-    # LR for higher-order SH (detail)
     shN_lr: float = 2.5e-3 / 20
 
     # Opacity regularization
@@ -154,46 +103,41 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
-    # Enable camera optimization.
+    # foreground loss settings
+    foreground_loss: bool = True # whether to use foreground loss
+    foreground_lambda: float = 0.1 # foreground loss weights
+    foreground_lr: float = 1e-3 # learning rate
+    foreground_warmup_steps: int = 500
+    
+    # Foreground masking mode: set foreground gaussians to black
+    foreground_mask_to_black: bool = False  # 强制前景高斯为黑色
+    green_threshold_lower: Tuple[float, float, float] = (0.0, 0.5, 0.0)  # 绿色下界 RGB
+    green_threshold_upper: Tuple[float, float, float] = (0.5, 1.0, 0.5)  # 绿色上界 RGB 
+
     pose_opt: bool = False
-    # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
-    # Regularization for camera optimization as weight decay
     pose_opt_reg: float = 1e-6
-    # Add noise to camera extrinsics. This is only to test the camera pose optimization.
     pose_noise: float = 0.0
 
-    # Enable appearance optimization. (experimental)
     app_opt: bool = False
-    # Appearance embedding dimension
     app_embed_dim: int = 16
-    # Learning rate for appearance optimization
     app_opt_lr: float = 1e-3
-    # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
-    # Enable bilateral grid. (experimental)
     use_bilateral_grid: bool = False
-    # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
-    # Enable depth loss. (experimental)
     depth_loss: bool = False
-    # Weight for depth loss
     depth_lambda: float = 1e-2
 
-    # Dump information to tensorboard every this steps
     tb_every: int = 100
-    # Save training images to tensorboard
     tb_save_image: bool = False
 
     lpips_net: Literal["vgg", "alex"] = "alex"
-
-    # 3DGUT (uncented transform + eval 3D)
+    
     with_ut: bool = False
     with_eval3d: bool = False
 
-    # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
     def adjust_steps(self, factor: float):
@@ -217,7 +161,7 @@ class Config:
             assert_never(strategy)
 
 
-def create_splats_with_optimizers(
+def create_splats_with_optimiers(
     parser: Parser,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
@@ -225,6 +169,7 @@ def create_splats_with_optimizers(
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
     means_lr: float = 1.6e-4,
+    foreground_lr: float = 1e-3,
     scales_lr: float = 5e-3,
     opacities_lr: float = 5e-2,
     quats_lr: float = 1e-3,
@@ -239,57 +184,77 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    checkpoint_splats: Optional[Dict] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
+    
+    # If checkpoint is provided, use it directly instead of initializing
+    if checkpoint_splats is not None:
+        # Create params list from checkpoint for optimizer creation
+        params = [
+            ("means", checkpoint_splats["means"], means_lr * scene_scale),
+            ("scales", checkpoint_splats["scales"], scales_lr),
+            ("quats", checkpoint_splats["quats"], quats_lr),
+            ("opacities", checkpoint_splats["opacities"], opacities_lr),
+            ("foreground_logits", checkpoint_splats["foreground_logits"], foreground_lr),
+        ]
+        
+        if "sh0" in checkpoint_splats:
+            params.append(("sh0", checkpoint_splats["sh0"], sh0_lr))
+            params.append(("shN", checkpoint_splats["shN"], shN_lr))
+        elif "features" in checkpoint_splats:
+            params.append(("features", checkpoint_splats["features"], sh0_lr))
+            params.append(("colors", checkpoint_splats["colors"], sh0_lr))
+        
+        splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        # Normal initialization
+        if init_type == "sfm":
+            points = torch.from_numpy(parser.points).float()
+            rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif init_type == "random":
+            points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+            rgbs = torch.rand((init_num_pts, 3))
+        else:
+            raise ValueError("init_type must be 'sfm' or 'random'")
+        
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+        points = points[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        scales = scales[world_rank::world_size]
 
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+        N = points.shape[0]
+        quats = torch.rand((N, 4))
+        opacities = torch.logit(torch.full((N,), init_opacity)) 
 
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+        # add foreground parameter, initialized as logit(0.5) = 0, which represents uncertainty
+        foreground_logits = torch.zeros((N, ))
 
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
-        ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
-        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
-    ]
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+            ("foreground_logits", torch.nn.Parameter(foreground_logits), foreground_lr),
+        ]
 
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+        if feature_dim is None:
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))
+            colors[:, 0, :] = rgb_to_sh(rgbs)
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        else:
+            features = torch.rand(N, feature_dim)
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(rgbs)
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
-    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size, reference:
-    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-    # Note that this would not make the training exactly equivalent, see
-    # https://arxiv.org/pdf/2402.18824v1
-    BS = batch_size * world_size
+        splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+
+    BS = batch_size
     optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
@@ -297,24 +262,21 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            eps = 1e-15 / math.sqrt(BS),
+            # TODO
+            betas = (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
         )
         for name, _, lr in params
     }
+    
     return splats, optimizers
 
-
 class Runner:
-    """Engine for training and testing."""
-
-    def __init__(
-        self, local_rank: int, world_rank, world_size: int, cfg: Config
-    ) -> None:
+    def __init__(self, local_rank: int, world_rank, world_size: int, cfg: Config) -> None:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
@@ -323,10 +285,8 @@ class Runner:
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
 
-        # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
 
-        # Setup output directories.
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
         self.stats_dir = f"{cfg.result_dir}/stats"
@@ -336,13 +296,11 @@ class Runner:
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
 
-        # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
-        # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
+            data_dir = cfg.data_dir,
+            factor = cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
@@ -356,9 +314,26 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
-        # Model
+        self.train_masks = self._load_foreground_masks()
+
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
+        
+        # Check if we need to load from checkpoint
+        checkpoint_splats = None
+        if cfg.ckpt is not None and len(cfg.ckpt) > 0:
+            print(f"Loading checkpoint from {cfg.ckpt[world_rank]}")
+            checkpoint = torch.load(cfg.ckpt[world_rank], map_location=self.device)
+            checkpoint_splats = checkpoint["splats"]
+            
+            # If foreground_logits is not in checkpoint, initialize it
+            if "foreground_logits" not in checkpoint_splats:
+                num_gs = checkpoint_splats["means"].shape[0]
+                checkpoint_splats["foreground_logits"] = torch.nn.Parameter(
+                    torch.zeros((num_gs,), device=self.device)
+                )
+                print(f"Initialized foreground_logits for {num_gs} Gaussians (not in checkpoint)")
+        
+        self.splats, self.optimizers = create_splats_with_optimiers(
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
@@ -366,6 +341,7 @@ class Runner:
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
             means_lr=cfg.means_lr,
+            foreground_lr=cfg.foreground_lr,
             scales_lr=cfg.scales_lr,
             opacities_lr=cfg.opacities_lr,
             quats_lr=cfg.quats_lr,
@@ -380,8 +356,13 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            checkpoint_splats=checkpoint_splats,
         )
-        print("Model initialized. Number of GS:", len(self.splats["means"]))
+        
+        if checkpoint_splats is not None:
+            print(f"Loaded checkpoint. Number of GS: {len(self.splats['means'])}")
+        else:
+            print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -395,14 +376,13 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
-        # Compression Strategy
         self.compression_method = None
         if cfg.compression is not None:
             if cfg.compression == "png":
                 self.compression_method = PngCompression()
             else:
                 raise ValueError(f"Unknown compression strategy: {cfg.compression}")
-
+            
         self.pose_optimizers = []
         if cfg.pose_opt:
             self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
@@ -488,6 +468,69 @@ class Runner:
                 mode="training",
             )
 
+    def _load_foreground_masks(self) -> Dict[int, torch.Tensor]:
+        masks = {}
+        
+        if self.cfg.foreground_mask_to_black:
+            # 从带绿色标记的图片中提取前景mask
+            print("Detecting green foreground regions from images...")
+            for image_id in self.trainset.indices:
+                image_name = self.parser.image_names[image_id]
+                image_path = Path(self.cfg.data_dir) / "images" / image_name
+                
+                if not image_path.exists():
+                    print(f"Warning: Image {image_path} not found")
+                    continue
+                
+                # 加载图片
+                img = imageio.imread(image_path)
+                if len(img.shape) == 2:  # 灰度图
+                    print(f"Warning: Image {image_name} is grayscale, skipping")
+                    continue
+                    
+                img = torch.from_numpy(img).float() / 255.0  # [H, W, 3], 归一化到 [0, 1]
+                
+                # 检测绿色区域
+                lower = torch.tensor(self.cfg.green_threshold_lower, device=img.device)
+                upper = torch.tensor(self.cfg.green_threshold_upper, device=img.device)
+                
+                # 绿色mask: 所有通道都在阈值范围内
+                green_mask = (img >= lower) & (img <= upper)
+                green_mask = green_mask.all(dim=-1).float()  # [H, W]
+                
+                masks[image_id] = green_mask.to(self.device)
+            
+            print(f"Detected green foreground in {len(masks)} images")
+        else:
+            # 原来的方式：从mask目录加载
+            mask_dir = Path(self.cfg.data_dir) / "masks"
+            
+            if not mask_dir.exists():
+                print(f"Warning: Mask directory {mask_dir} not found. Foreground loss will be disabled.")
+                return masks
+            
+            for image_id in self.trainset.indices:
+                image_name = self.parser.image_names[image_id]
+                mask_path = None
+                for ext in ['.png', '.jpg', '.jpeg', '.PNG', '.JPG']:
+                    potential_path = mask_dir / f"{Path(image_name).stem}{ext}"
+                    if potential_path.exists():
+                        mask_path = potential_path
+                        break
+                
+                if mask_path is not None:
+                    mask = imageio.imread(mask_path)
+                    if len(mask.shape) == 3:
+                        mask = mask[..., 0]
+                    mask = torch.from_numpy(mask).float() / 255.0
+                    masks[image_id] = mask.to(self.device)
+                else:
+                    print(f"Warning: Mask not found for image {image_name}")
+            
+            print(f"Loaded {len(masks)} foreground masks")
+        
+        return masks
+    
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -550,7 +593,7 @@ class Runner:
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
-
+    
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -679,6 +722,45 @@ class Runner:
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
+
+            # 前景遮罩模式：将落在前景的高斯球颜色设为黑色
+            if cfg.foreground_mask_to_black:
+                image_id = image_ids[0].item()
+                if image_id in self.train_masks:
+                    foreground_mask = self.train_masks[image_id]  # [H_orig, W_orig]
+                    # Resize mask to match rendered image size if needed
+                    if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
+                        foreground_mask = torch.nn.functional.interpolate(
+                            foreground_mask.unsqueeze(0).unsqueeze(0),  # [1, 1, H_orig, W_orig]
+                            size=(height, width),
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze(0).squeeze(0)  # [height, width]
+                    # 将前景区域的颜色设为黑色
+                    colors = colors * (1.0 - foreground_mask.unsqueeze(0).unsqueeze(-1))
+                    
+                    # 同时更新高斯球的颜色参数
+                    if cfg.packed and "gaussian_ids" in info and "pixel_ids" in info:
+                        with torch.no_grad():
+                            gaussian_ids = info["gaussian_ids"]
+                            pixel_ids = info["pixel_ids"]
+                            
+                            # 将pixel_ids转换为坐标
+                            y = pixel_ids // width
+                            x = pixel_ids % width
+                            
+                            # 检查哪些高斯球落在前景
+                            is_foreground = foreground_mask[y, x] > 0.5
+                            foreground_gaussians = gaussian_ids[is_foreground].unique()
+                            
+                            # 将这些高斯球的颜色设为黑色
+                            if self.cfg.app_opt:
+                                # 如果使用appearance模块，调整colors参数
+                                self.splats["colors"].data[foreground_gaussians] = torch.logit(torch.tensor(0.01, device=device))
+                            else:
+                                # 否则调整sh0 (球谐函数的第0项对应基础颜色)
+                                black_sh0 = rgb_to_sh(torch.zeros(1, 1, 3, device=device))
+                                self.splats["sh0"].data[foreground_gaussians] = black_sh0
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -912,252 +994,131 @@ class Runner:
                 self.viewer.update(step, num_train_rays_per_step)
 
     @torch.no_grad()
-    def eval(self, step: int, stage: str = "val"):
-        """Entry for evaluation."""
-        print("Running evaluation...")
-        cfg = self.cfg
-        device = self.device
-        world_rank = self.world_rank
-        world_size = self.world_size
-
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
-        )
-        ellipse_time = 0
-        metrics = defaultdict(list)
-        for i, data in enumerate(valloader):
-            camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
-            masks = data["mask"].to(device) if "mask" in data else None
-            height, width = pixels.shape[1:3]
-
-            torch.cuda.synchronize()
-            tic = time.time()
-            colors, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                masks=masks,
-            )  # [1, H, W, 3]
-            torch.cuda.synchronize()
-            ellipse_time += max(time.time() - tic, 1e-10)
-
-            colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
-
-            if world_rank == 0:
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
-
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
-                if cfg.use_bilateral_grid:
-                    cc_colors = color_correct(colors, pixels)
-                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
-                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
-                    metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
-
-        if world_rank == 0:
-            ellipse_time /= len(valloader)
-
-            stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
-            stats.update(
-                {
-                    "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["means"]),
-                }
-            )
-            if cfg.use_bilateral_grid:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            else:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            # save stats as json
-            with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
-                json.dump(stats, f)
-            # save stats to tensorboard
-            for k, v in stats.items():
-                self.writer.add_scalar(f"{stage}/{k}", v, step)
-            self.writer.flush()
+    def eval(self, step: int):
+        """Evaluation method - simplified version for OR_trainer."""
+        print(f"Evaluation at step {step} - skipped (not implemented in OR_trainer)")
+        # Note: Full evaluation implementation can be added here if needed
+        pass
 
     @torch.no_grad()
     def render_traj(self, step: int):
-        """Entry for trajectory rendering."""
+        """Trajectory rendering - simplified version for OR_trainer."""
         if self.cfg.disable_video:
             return
-        print("Running trajectory rendering...")
-        cfg = self.cfg
-        device = self.device
-
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
-        if cfg.render_traj_path == "interp":
-            camtoworlds_all = generate_interpolated_path(
-                camtoworlds_all, 1
-            )  # [N, 3, 4]
-        elif cfg.render_traj_path == "ellipse":
-            height = camtoworlds_all[:, 2, 3].mean()
-            camtoworlds_all = generate_ellipse_path_z(
-                camtoworlds_all, height=height
-            )  # [N, 3, 4]
-        elif cfg.render_traj_path == "spiral":
-            camtoworlds_all = generate_spiral_path(
-                camtoworlds_all,
-                bounds=self.parser.bounds * self.scene_scale,
-                spiral_scale_r=self.parser.extconf["spiral_radius_scale"],
-            )
-        else:
-            raise ValueError(
-                f"Render trajectory type not supported: {cfg.render_traj_path}"
-            )
-
-        camtoworlds_all = np.concatenate(
-            [
-                camtoworlds_all,
-                np.repeat(
-                    np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds_all), axis=0
-                ),
-            ],
-            axis=1,
-        )  # [N, 4, 4]
-
-        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-        width, height = list(self.parser.imsize_dict.values())[0]
-
-        # save to video
-        video_dir = f"{cfg.result_dir}/videos"
-        os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
-        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
-
-            renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [1, H, W, 4]
-            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
-            depths = renders[..., 3:4]  # [1, H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
-            canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
-
-            # write images
-            canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-            canvas = (canvas * 255).astype(np.uint8)
-            writer.append_data(canvas)
-        writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
-
-    ############################### for depth maps ####################################################
-
-    @torch.no_grad()
-    def  render_train_depths(self):
-        """render all depth maps for training images and evaluation images"""
-        print("Rendering all depth maps(train + val)...")
-        save_dir = f"{self.cfg.result_dir}/train_depths"
-        os.makedirs(save_dir, exist_ok=True)
-        import matplotlib.pyplot as plt
-
-        full_set = Dataset(self.parser, split="train")
-        full_set.indices = np.arange(len(self.parser.image_names))
-
-        for i in tqdm.tqdm(range(len(full_set)), desc="Rendering depths"):
-            data = full_set[i]
-
-            camtoworlds = data['camtoworld'].to(self.device)[None]
-            Ks = data["K"].to(self.device)[None]
-            height, width = data["image"].shape[:2]
-
-            # use "ED(Expected Depth)" mode to render depth
-            renders, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=self.cfg.sh_degree,
-                near_plane=self.cfg.near_plane,
-                far_plane=self.cfg.far_plane,
-                render_mode="ED",
-            )
-
-            # renders shape: [1, H, W, 1]
-            depth = renders[0, ..., 0].cpu().numpy()
-
-            # 1. save originally depth data(.npy)
-            original_filename = self.parser.image_names[i]
-            base_name = os.path.splitext(os.path.basename(original_filename))[0]
-            np.save(f"{save_dir}/{base_name}.npy", depth)
-
-            # 2. save absolute depth map(.png)
-            # convert meter to milimeter(x1000) and save as uint16
-            depth_uint16 = (depth * 1000).astype(np.uint16)
-            plt.imsave(f"{save_dir}/{base_name}_ab.png", depth_uint16)
-
-            # 3. save visualization depth map(.png)
-            valid_mask = depth > 0
-            if valid_mask.any():
-                d_min, d_max = depth[valid_mask].min(), depth[valid_mask].max()
-                depth_vis = (depth - d_min) / (d_max - d_min + 1e-8)
-                depth_vis[~valid_mask] = 0
-            else:
-                depth_vis = depth
-
-            # use turbo colorimage to save, blue->close, red->far
-            plt.imsave(f"{save_dir}/{base_name}.png", depth_vis, cmap='turbo')
-
-        print(f"Depth maps saved to {save_dir}")
-
-    ###################################################################################################
+        print(f"Trajectory rendering at step {step} - skipped (not implemented in OR_trainer)")
+        pass
 
     @torch.no_grad()
     def run_compression(self, step: int):
-        """Entry for running compression."""
-        print("Running compression...")
-        world_rank = self.world_rank
+        """Compression - simplified version for OR_trainer."""
+        print(f"Compression at step {step} - skipped (not implemented in OR_trainer)")
+        pass
 
-        compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
-        os.makedirs(compress_dir, exist_ok=True)
+    def _compute_foreground_loss(
+        self,
+        info: Dict,
+        mask_gt: torch.Tensor,
+        height: int,
+        width: int
+    ) -> torch.Tensor:
+        if self.cfg.packed:
+            # Packed 模式：使用 gaussian_ids 和 pixel_ids
+            gaussian_ids = info["gaussian_ids"]  # [nnz]
+            pixel_ids = info["pixel_ids"]  # [nnz]
+            
+            # 将 pixel_ids 转换为 (y, x) 坐标
+            y = pixel_ids // width
+            x = pixel_ids % width
+            
+            # 获取每个高斯球对应像素的 ground truth 前景值
+            fg_gt_per_gaussian = mask_gt[y, x]  # [nnz]
+            
+            # 获取每个高斯球的前景预测概率
+            fg_pred_logits = self.splats["foreground_logits"][gaussian_ids]  # [nnz]
+            
+            # 二元交叉熵损失
+            loss = F.binary_cross_entropy_with_logits(
+                fg_pred_logits, 
+                fg_gt_per_gaussian,
+                reduction='mean'
+            )
+            
+        else:
+            # 非 Packed 模式：使用 radii
+            radii = info["radii"]  # [C, N] C是相机数量，N是高斯球数量
+            
+            # 对于每个高斯球，检查它在图像中的可见性
+            is_visible = (radii > 0).any(0)  # [N]
+            
+            if not is_visible.any():
+                return torch.tensor(0.0, device=self.device)
+            
+            # 获取可见高斯球的前景预测
+            fg_pred_logits = self.splats["foreground_logits"][is_visible]  # [N_visible]
+            
+            # 渲染前景概率图
+            # 这里需要使用高斯球的前景概率重新渲染一个前景图
+            fg_probs = torch.sigmoid(self.splats["foreground_logits"])  # [N]
+            fg_rendered = self._render_foreground_map(info, fg_probs, height, width)
+            
+            # 与 ground truth mask 比较
+            loss = F.binary_cross_entropy(fg_rendered, mask_gt, reduction='mean')
+        
+        return loss
+    
+    def _render_foreground_map(
+        self, 
+        info: Dict,
+        fg_probs: torch.Tensor,
+        height: int,
+        width: int
+    ) -> torch.Tensor:
+        """
+        使用高斯球的前景概率渲染前景图
+        
+        Args:
+            info: 渲染信息
+            fg_probs: 每个高斯球的前景概率 [N]
+            height, width: 图像尺寸
+        
+        Returns:
+            fg_map: 渲染的前景图 [H, W]
+        """
+        # 使用类似于颜色渲染的方式，用前景概率替代颜色
+        # 这需要调用底层的光栅化函数，但只渲染单通道
+        
+        # 简化版本：直接从 packed 信息构建
+        if self.cfg.packed and "gaussian_ids" in info and "pixel_ids" in info:
+            gaussian_ids = info["gaussian_ids"]
+            pixel_ids = info["pixel_ids"]
+            weights = info.get("weights", None)  # 如果有权重信息
+            
+            fg_map = torch.zeros(height * width, device=self.device)
+            fg_values = fg_probs[gaussian_ids]
+            
+            if weights is not None:
+                # 使用权重进行加权平均
+                fg_map.scatter_add_(0, pixel_ids, fg_values * weights)
+            else:
+                # 简单平均
+                counts = torch.zeros(height * width, device=self.device)
+                fg_map.scatter_add_(0, pixel_ids, fg_values)
+                counts.scatter_add_(0, pixel_ids, torch.ones_like(fg_values))
+                fg_map = fg_map / (counts + 1e-8)
+            
+            fg_map = fg_map.reshape(height, width)
+        else:
+            # 如果没有 packed 信息，返回零图
+            fg_map = torch.zeros(height, width, device=self.device)
+        
+        return fg_map
 
-        self.compression_method.compress(compress_dir, self.splats)
-
-        # evaluate compression
-        splats_c = self.compression_method.decompress(compress_dir)
-        for k in splats_c.keys():
-            self.splats[k].data = splats_c[k].to(self.device)
-        self.eval(step=step, stage="compress")
-
-    @torch.no_grad()
     def _viewer_render_fn(
-        self, camera_state: CameraState, render_tab_state: RenderTabState
+        self, camera_state, render_tab_state
     ):
+        """Render function for the viewer - simplified version for OR_trainer."""
+        from simple_viewer import CameraState, GsplatRenderTabState
+        
         assert isinstance(render_tab_state, GsplatRenderTabState)
         if render_tab_state.preview_render:
             width = render_tab_state.render_width
@@ -1185,13 +1146,7 @@ class Runner:
             sh_degree=min(render_tab_state.max_sh_degree, self.cfg.sh_degree),
             near_plane=render_tab_state.near_plane,
             far_plane=render_tab_state.far_plane,
-            radius_clip=render_tab_state.radius_clip,
-            eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
-            / 255.0,
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
-            rasterize_mode=render_tab_state.rasterize_mode,
-            camera_model=render_tab_state.camera_model,
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(self.splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
@@ -1199,9 +1154,11 @@ class Runner:
         if render_tab_state.render_mode == "rgb":
             # colors represented with sh are not guranteed to be in [0, 1]
             render_colors = render_colors[0, ..., 0:3].clamp(0, 1)
-            renders = render_colors.cpu().numpy()
+            renders = render_colors.detach().cpu().numpy()
         elif render_tab_state.render_mode in ["depth(accumulated)", "depth(expected)"]:
             # normalize depth to [0, 1]
+            from simple_viewer import apply_float_colormap
+            
             depth = render_colors[0, ..., 0:1]
             if render_tab_state.normalize_nearfar:
                 near_plane = render_tab_state.near_plane
@@ -1215,20 +1172,23 @@ class Runner:
                 depth_norm = 1 - depth_norm
             renders = (
                 apply_float_colormap(depth_norm, render_tab_state.colormap)
+                .detach()
                 .cpu()
                 .numpy()
             )
         elif render_tab_state.render_mode == "alpha":
+            from simple_viewer import apply_float_colormap
+            
             alpha = render_alphas[0, ..., 0:1]
             if render_tab_state.inverse:
                 alpha = 1 - alpha
             renders = (
-                apply_float_colormap(alpha, render_tab_state.colormap).cpu().numpy()
+                apply_float_colormap(alpha, render_tab_state.colormap).detach().cpu().numpy()
             )
         return renders
 
 
-def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+def main(local_rank: int, world_rank: int, world_size: int, cfg: Config):
     if world_size > 1 and not cfg.disable_viewer:
         cfg.disable_viewer = True
         if world_rank == 0:
@@ -1236,10 +1196,10 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
-    if cfg.ckpt is not None:
-        # run eval only
+    if cfg.ckpt is not None and not cfg.foreground_mask_to_black:
+        # run eval only (unless in foreground masking mode)
         ckpts = [
-            torch.load(file, map_location=runner.device, weights_only=True)
+            torch.load(file, map_location=runner.device, weights_only=False)
             for file in cfg.ckpt
         ]
         for k in runner.splats.keys():
@@ -1250,10 +1210,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:
+        # Training mode (including foreground masking mode)
         runner.train()
-
-    if cfg.save_train_depths:
-        runner.render_train_depths()
 
     if not cfg.disable_viewer:
         runner.viewer.complete()
@@ -1267,24 +1225,28 @@ if __name__ == "__main__":
 
     ```bash
     # Single GPU training
-    CUDA_VISIBLE_DEVICES=9 python -m examples.simple_trainer default
+    python examples/OR_trainer.py --data_dir data/kitchen
 
-    # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
+    # With checkpoint for foreground masking
+    python examples/OR_trainer.py \
+        --data_dir data/Tree_Filled \
+        --ckpt results/Tree/ckpts/ckpt_29999_rank0.pt \
+        --foreground_mask_to_black True
 
+    # Distributed training on 4 GPUs
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python examples/OR_trainer.py --data_dir data/kitchen
     """
 
-    # Config objects we can choose between.
-    # Each is a tuple of (CLI description, config object).
+    # Config objects
     configs = {
         "default": (
-            "Gaussian splatting training using densification heuristics from the original paper.",
+            "Gaussian splatting training with foreground masking support.",
             Config(
                 strategy=DefaultStrategy(verbose=True),
             ),
         ),
         "mcmc": (
-            "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
+            "Gaussian splatting training using MCMC strategy.",
             Config(
                 init_opa=0.5,
                 init_scale=0.1,
@@ -1294,41 +1256,10 @@ if __name__ == "__main__":
             ),
         ),
     }
-    cfg = tyro.extras.overridable_config_cli(configs)
-    cfg.adjust_steps(cfg.steps_scaler)
-
-    # Import BilateralGrid and related functions based on configuration
-    if cfg.use_bilateral_grid or cfg.use_fused_bilagrid:
-        if cfg.use_fused_bilagrid:
-            cfg.use_bilateral_grid = True
-            from fused_bilagrid import (
-                BilateralGrid,
-                color_correct,
-                slice,
-                total_variation_loss,
-            )
-        else:
-            cfg.use_bilateral_grid = True
-            from lib_bilagrid import (
-                BilateralGrid,
-                color_correct,
-                slice,
-                total_variation_loss,
-            )
-
-    # try import extra dependencies
-    if cfg.compression == "png":
-        try:
-            import plas
-            import torchpq
-        except:
-            raise ImportError(
-                "To use PNG compression, you need to install "
-                "torchpq (instruction at https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install) "
-                "and plas (via 'pip install git+https://github.com/fraunhoferhhi/PLAS.git') "
-            )
-
-    if cfg.with_ut:
-        assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
-
+    
+    # Parse config
+    cfg = tyro.cli(Config)
+    cfg.adjust_steps(cfg.steps_scalar)
+    
+    # Launch
     cli(main, cfg, verbose=True)

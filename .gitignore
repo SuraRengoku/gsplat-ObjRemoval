@@ -4,6 +4,9 @@ compile_commands.json
 # Visual Studio Code configs.
 .vscode/
 
+# sam checkpoints
+sam_checkpoints/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -1,3 +1,13 @@
+# Note: This is a research fork of [gsplat](https://github.com/nerfstudio-project/gsplat)
+
+## Modifications:
+- Added explicit depth map rendering (`render_train_depths`).
+- Implemented geometry-based video object segmentation using SAM/FastSAM.
+- Added camera pose analysis tools.
+
+## Usage:
+See `examples/propagate_segmentation.py` for the segmentation pipeline.
+
 # gsplat
 
 [![Core Tests.](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml/badge.svg?branch=main)](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml)

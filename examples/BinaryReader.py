@@ -161,3 +161,85 @@ if __name__ == "__main__":
     print(f"coordinate: {pt.xyz}")
     print(f"color: {pt.rgb}")
     print(f"reprojection error: {pt.error}")
+
+def read_colmap_depth(path):
+    """
+    Read COLMAP depth map file.
+    
+    COLMAP depth maps can be in two formats:
+    1. Text header + binary data: "width&height&channels&" followed by float32 array
+    2. Pure binary: width(int32) height(int32) channels(int32) data(float32 array)
+    """
+    import os
+    filesize = os.path.getsize(path)
+    
+    with open(path, "rb") as f:
+        # Read first few bytes to detect format
+        first_bytes = f.read(20)
+        f.seek(0)
+        
+        # Check if it starts with ASCII digits (text format)
+        if first_bytes[0:1].decode('ascii', errors='ignore').isdigit():
+            # Text header format: "width&height&channels&" + binary data
+            header_str = b""
+            while True:
+                char = f.read(1)
+                if not char:
+                    raise ValueError(f"Unexpected end of file while reading header from {path}")
+                header_str += char
+                # Header ends with "&" after channels
+                if header_str.count(b'&') == 3:
+                    break
+            
+            # Parse header
+            header_text = header_str.decode('ascii').rstrip('&')
+            parts = header_text.split('&')
+            
+            if len(parts) != 3:
+                raise ValueError(f"Invalid header format: {header_text} from {path}")
+            
+            width, height, channels = map(int, parts)
+            
+            print(f"Reading COLMAP depth (text header): {width}x{height}x{channels} from {path}")
+            
+            # Sanity check
+            if width <= 0 or height <= 0 or width > 10000 or height > 10000 or channels <= 0:
+                raise ValueError(f"Invalid dimensions: {width}x{height}x{channels} from {path}")
+            
+            # Read depth data as float32
+            num_values = width * height * channels
+            depth_data = np.fromfile(f, dtype=np.float32, count=num_values)
+            
+            if len(depth_data) != num_values:
+                raise ValueError(f"Expected {num_values} values, got {len(depth_data)} from {path}")
+            
+            # Reshape
+            if channels == 1:
+                return depth_data.reshape(height, width)
+            else:
+                # Return first channel (depth)
+                depth_data = depth_data.reshape(height, width, channels)
+                return depth_data[:, :, 0]
+        
+        else:
+            # Binary format: width(int32) height(int32) channels(int32) data(float32)
+            width = struct.unpack('<I', f.read(4))[0]
+            height = struct.unpack('<I', f.read(4))[0]
+            channels = struct.unpack('<I', f.read(4))[0]
+            
+            print(f"Reading COLMAP depth (binary header): {width}x{height}x{channels} from {path}")
+            
+            if width <= 0 or height <= 0 or width > 10000 or height > 10000 or channels <= 0:
+                raise ValueError(f"Invalid dimensions: {width}x{height}x{channels} from {path}")
+            
+            num_values = width * height * channels
+            depth_data = np.fromfile(f, dtype=np.float32, count=num_values)
+            
+            if len(depth_data) != num_values:
+                raise ValueError(f"Expected {num_values} values, got {len(depth_data)} from {path}")
+            
+            if channels == 1:
+                return depth_data.reshape(height, width)
+            else:
+                depth_data = depth_data.reshape(height, width, channels)
+                return depth_data[:, :, 0]

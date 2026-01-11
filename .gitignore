@@ -6,6 +6,7 @@ compile_commands.json
 
 # sam checkpoints
 sam_checkpoints/
+sam2_checkpoints/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

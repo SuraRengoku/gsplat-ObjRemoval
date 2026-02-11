@@ -9,7 +9,7 @@ import sys
 
 # Test both methods
 if __name__ == "__main__":
-    from propagate_segmentation import run_propagation_anchor
+    from examples.Propagate_segmentation import run_propagation_anchor
     
     COLMAP_PATH = "data/Tree/sparse/0"
     IMAGES_DIR = "data/Tree/images_2"

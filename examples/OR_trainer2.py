@@ -1,5 +1,18 @@
 # type: ignore
 
+"""
+usage: python examples/OR_trainer2.py \
+        --data_dir data/Tree \
+        --result_dir results/Tree_Removed \
+        --data_factor 2 \
+        --ckpt results/Tree/ckpts/ckpt_29999_rank0.pt \
+        --remove_foreground_gaussians \
+        --foreground_thresh 0.5 \
+        --max_steps 5000 \
+        --mask_type Sam2 \
+        --save_ply
+"""
+
 import json
 import math
 import os
@@ -196,27 +209,161 @@ def create_splats_with_optimiers(
     world_rank: int = 0,
     world_size: int = 1,
     checkpoint_splats: Optional[Dict] = None,
+    freeze_original_params: bool = False, # free initial splats parameters
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     
     # If checkpoint is provided, use it directly instead of initializing
     if checkpoint_splats is not None:
-        # Create params list from checkpoint for optimizer creation
-        params = [
-            ("means", checkpoint_splats["means"], means_lr * scene_scale),
-            ("scales", checkpoint_splats["scales"], scales_lr),
-            ("quats", checkpoint_splats["quats"], quats_lr),
-            ("opacities", checkpoint_splats["opacities"], opacities_lr),
-            ("foreground_logits", checkpoint_splats["foreground_logits"], foreground_lr),
-        ]
-        
-        if "sh0" in checkpoint_splats:
-            params.append(("sh0", checkpoint_splats["sh0"], sh0_lr))
-            params.append(("shN", checkpoint_splats["shN"], shN_lr))
-        elif "features" in checkpoint_splats:
-            params.append(("features", checkpoint_splats["features"], sh0_lr))
-            params.append(("colors", checkpoint_splats["colors"], sh0_lr))
-        
-        splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+        # if there is no foreground_logits in checkpoint, add it
+        if "foreground_logits" not in checkpoint_splats:
+            num_gs = checkpoint_splats["means"].shape[0]
+            checkpoint_splats["foreground_logits"] = torch.nn.Parameter(
+                torch.zeros((num_gs), device=device)
+            )
+            print(f"Initialized foreground_logits for {num_gs} Gaussians (not in checkpoint)")
+
+        if freeze_original_params:
+            # 冻结模式：只添加foreground_logits到params（用于创建优化器）
+            params = [
+                ("foreground_logits", checkpoint_splats["foreground_logits"], foreground_lr),
+            ]
+
+            # 创建一个wrapper类，继承自ParameterDict但只暴露可训练参数
+            class FrozenParameterDict(torch.nn.ParameterDict):
+                """只将可训练参数暴露给策略检查器"""
+                def __init__(self, trainable_params, frozen_params):
+                    # 先初始化 _frozen_keys，避免在父类 __init__ 调用 __setitem__ 时出错
+                    object.__setattr__(self, '_frozen_keys', set(frozen_params.keys()))
+                    
+                    # 只用trainable_params初始化ParameterDict
+                    super().__init__(trainable_params)
+                    
+                    # frozen_params作为普通属性存储，不走Parameter注册流程
+                    for key, value in frozen_params.items():
+                        # 使用object.__setattr__绕过ParameterDict的__setitem__
+                        object.__setattr__(self, key, value)
+                
+                def __getitem__(self, key):
+                    # 先尝试从ParameterDict获取
+                    if key in self._parameters:
+                        return self._parameters[key]
+                    # 否则从frozen attributes获取
+                    if key in self._frozen_keys:
+                        return object.__getattribute__(self, key)
+                    raise KeyError(f"Key '{key}' not found")
+                
+                def __setitem__(self, key, value):
+                    # 支持更新参数（例如在 pruning 时）
+                    if key in self._parameters:
+                        # 可训练参数：使用父类方法
+                        super().__setitem__(key, value)
+                    elif key in self._frozen_keys:
+                        # 冻结参数：直接更新属性
+                        object.__setattr__(self, key, value)
+                    else:
+                        # 新参数：默认作为可训练参数
+                        super().__setitem__(key, value)
+                
+                def __contains__(self, key):
+                    # 检查是否包含某个键（包括frozen的）
+                    return key in self._parameters or key in self._frozen_keys
+                
+                def keys(self):
+                    # 返回所有键（包括冻结的）
+                    return list(set(self._parameters.keys()) | self._frozen_keys)
+                
+                def parameters(self, recurse=True):
+                    # 只返回可训练参数，这是strategy检查时调用的
+                    return super().parameters(recurse)
+                
+                def state_dict(self, destination=None, prefix='', keep_vars=False):
+                    """
+                    重写 state_dict 以包含冻结参数
+                    确保保存 checkpoint 时包含所有参数（可训练的和冻结的）
+                    """
+                    # 先获取可训练参数的 state_dict
+                    state = super().state_dict(destination, prefix, keep_vars)
+                    
+                    # 添加冻结参数
+                    for key in self._frozen_keys:
+                        frozen_param = object.__getattribute__(self, key)
+                        if keep_vars:
+                            state[prefix + key] = frozen_param
+                        else:
+                            state[prefix + key] = frozen_param.detach()
+                    
+                    return state
+                
+                def load_state_dict(self, state_dict, strict=True):
+                    """
+                    重写 load_state_dict 以处理冻结参数
+                    """
+                    # 分离可训练参数和冻结参数
+                    trainable_state = {}
+                    frozen_state = {}
+                    
+                    for key, value in state_dict.items():
+                        if key in self._parameters:
+                            trainable_state[key] = value
+                        elif key in self._frozen_keys:
+                            frozen_state[key] = value
+                        elif strict:
+                            raise KeyError(f"Unexpected key in state_dict: {key}")
+                    
+                    # 加载可训练参数
+                    super().load_state_dict(trainable_state, strict=strict)
+                    
+                    # 加载冻结参数
+                    for key, value in frozen_state.items():
+                        if isinstance(value, torch.Tensor):
+                            object.__setattr__(self, key, value)
+                        else:
+                            object.__setattr__(self, key, torch.nn.Parameter(value))
+            
+            # 准备trainable和frozen参数
+            trainable_params = {
+                "foreground_logits": checkpoint_splats["foreground_logits"]
+            }
+            
+            frozen_params = {}
+            for key in ["means", "scales", "quats", "opacities"]:
+                param = checkpoint_splats[key]
+                param.requires_grad_(False)
+                frozen_params[key] = param.to(device)
+
+            if "sh0" in checkpoint_splats:
+                checkpoint_splats["sh0"].requires_grad_(False)
+                checkpoint_splats["shN"].requires_grad_(False)
+                frozen_params["sh0"] = checkpoint_splats["sh0"].to(device)
+                frozen_params["shN"] = checkpoint_splats["shN"].to(device)
+            elif "features" in checkpoint_splats:
+                checkpoint_splats["features"].requires_grad_(False)
+                checkpoint_splats["colors"].requires_grad_(False)
+                frozen_params["features"] = checkpoint_splats["features"].to(device)
+                frozen_params["colors"] = checkpoint_splats["colors"].to(device)
+            
+            splats = FrozenParameterDict(trainable_params, frozen_params).to(device)
+
+            print("Freezing mode enabled:")
+            print(f"  - Frozen params: means, scales, quats, opacities, sh0/shN (or features/colors)")
+            print(f"  - Trainable params: foreground_logits only")
+        else:
+            params = [
+                ("means", checkpoint_splats["means"], means_lr * scene_scale),
+                ("scales", checkpoint_splats["scales"], scales_lr),
+                ("quats", checkpoint_splats["quats"], quats_lr),
+                ("opacities", checkpoint_splats["opacities"], opacities_lr),
+                ("foreground_logits", checkpoint_splats["foreground_logits"], foreground_lr),
+            ]
+            
+            if "sh0" in checkpoint_splats:
+                params.append(("sh0", checkpoint_splats["sh0"], sh0_lr))
+                params.append(("shN", checkpoint_splats["shN"], shN_lr))
+            elif "features" in checkpoint_splats:
+                params.append(("features", checkpoint_splats["features"], sh0_lr))
+                params.append(("colors", checkpoint_splats["colors"], sh0_lr))
+            
+            splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     else:
         # Normal initialization
         if init_type == "sfm":
@@ -266,7 +413,6 @@ def create_splats_with_optimiers(
         splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
 
     BS = batch_size
-    optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
     elif visible_adam:
@@ -274,16 +420,17 @@ def create_splats_with_optimiers(
     else:
         optimizer_class = torch.optim.Adam
     
-    optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps = 1e-15 / math.sqrt(BS),
-            # TODO
-            betas = (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-        )
-        for name, _, lr in params
-    }
+    optimizers = {}
+    for name, param, lr in params:
+        if param.requires_grad:
+            optimizers[name] = optimizer_class(
+                [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+                eps=1e-15 / math.sqrt(BS),
+                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            )
     
+    print(f"Created optimizers for: {list(optimizers.keys())}")
+
     return splats, optimizers
 
 class Runner:
@@ -368,10 +515,20 @@ class Runner:
             world_rank=world_rank,
             world_size=world_size,
             checkpoint_splats=checkpoint_splats,
+            freeze_original_params=(checkpoint_splats is not None),
         )
         
         if checkpoint_splats is not None:
             print(f"Loaded checkpoint. Number of GS: {len(self.splats['means'])}")
+            
+            # 在冻结模式下，禁用 strategy 的 refinement（不需要 densification/pruning）
+            if isinstance(self.cfg.strategy, DefaultStrategy):
+                print("Freezing mode: Disabling strategy refinement (no densification/pruning)")
+                # 设置 refine_stop_iter = 0，这样 strategy 不会执行任何 refinement
+                self.cfg.strategy.refine_stop_iter = 0
+            elif isinstance(self.cfg.strategy, MCMCStrategy):
+                print("Freezing mode: Disabling MCMC strategy refinement")
+                self.cfg.strategy.refine_stop_iter = 0
         else:
             print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -897,12 +1054,15 @@ class Runner:
         max_steps = cfg.max_steps
         init_step = 0
 
-        schedulers = [
-            # means has a learning rate schedule, that end at 0.01 of the initial value
-            torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
-            ),
-        ]
+        schedulers = []
+        # means has a learning rate schedule, that end at 0.01 of the initial value
+        # 只在means优化器存在时才创建scheduler（冻结模式下不存在）
+        if "means" in self.optimizers:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -1051,79 +1211,149 @@ class Runner:
                                 black_sh0 = rgb_to_sh(torch.zeros(1, 1, 3, device=device))
                                 self.splats["sh0"].data[foreground_gaussians] = black_sh0
 
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
+            # 在冻结模式下，跳过 strategy 的 pre_backward 步骤
+            # 因为冻结参数不需要梯度，会导致 retain_grad() 失败
+            if len(self.optimizers) > 1 or "foreground_logits" not in self.optimizers:
+                # 正常模式：有多个优化器，或者不是只有 foreground_logits
+                self.cfg.strategy.step_pre_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                )
+            # else: 冻结模式，跳过 step_pre_backward
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
-            if cfg.use_bilateral_grid:
-                tvloss = 10 * total_variation_loss(self.bil_grids.grids)
-                loss += tvloss
+            # 检测是否为冻结模式（只训练 foreground_logits）
+            is_frozen_mode = (len(self.optimizers) == 1 and "foreground_logits" in self.optimizers)
+            
+            if is_frozen_mode:
+                # 冻结模式：只使用 foreground loss
+                # 渲染 loss 依赖于冻结参数，没有梯度，不能用于训练
+                fg_loss = torch.tensor(0.0, device=device)
+                
+                # 冻结模式下，从第 0 步就开始训练（忽略 warmup_steps）
+                if cfg.foreground_loss:
+                    image_id = image_ids[0].item()
+                    if image_id in self.train_masks:
+                        foreground_mask = self.train_masks[image_id]
+                        # 确保mask尺寸匹配
+                        if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
+                            foreground_mask = torch.nn.functional.interpolate(
+                                foreground_mask.unsqueeze(0).unsqueeze(0),
+                                size=(height, width),
+                                mode="nearest",
+                            ).squeeze(0).squeeze(0)
+                        
+                        fg_loss = self._compute_foreground_loss(
+                            info=info, mask_gt=foreground_mask, height=height, width=width
+                        )
+                        
+                        if step == 0:
+                            print(f"[Frozen Mode] Starting foreground_logits training from step 0")
+                            print(f"  foreground_loss: {fg_loss.item():.6f}")
+                            print(f"  Available info keys: {info.keys()}")
+                
+                if fg_loss.item() > 0:
+                    loss = cfg.foreground_lambda * fg_loss
+                else:
+                    # 没有有效的 foreground loss，创建一个空 loss 但不跳过
+                    # 避免 continue 导致 viewer lock 不释放
+                    loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    if step == 0:
+                        print(f"Warning: No valid foreground loss in frozen mode at step {step}")
+                        print(f"  image_id: {image_ids[0].item()}")
+                        print(f"  Has mask: {image_ids[0].item() in self.train_masks}")
+            else:
+                # 正常模式：使用渲染 loss + foreground loss
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+                
+                if cfg.depth_loss:
+                    # query depths from depth map
+                    points = torch.stack(
+                        [
+                            points[:, :, 0] / (width - 1) * 2 - 1,
+                            points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                    depths = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                    # calculate loss in disparity space
+                    disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                    disp_gt = 1.0 / depths_gt  # [1, M]
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                    loss += depthloss * cfg.depth_lambda
+                if cfg.use_bilateral_grid:
+                    tvloss = 10 * total_variation_loss(self.bil_grids.grids)
+                    loss += tvloss
 
-            # regularizations
-            if cfg.opacity_reg > 0.0:
-                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
-            if cfg.scale_reg > 0.0:
-                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+                # regularizations
+                if cfg.opacity_reg > 0.0:
+                    loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+                if cfg.scale_reg > 0.0:
+                    loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
-            # fg_loss = torch.tensor(0.0, device=device)
-            # if(
-            #     cfg.foreground_loss
-            #     and step >= cfg.foreground_warmup_steps
-            # ):
-            #     image_id = image_ids[0].item()
-            #     if image_id in self.train_masks:
-            #         foreground_mask = self.train_masks[image_id]
-            #         if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
-            #             foreground_mask = torch.nn.functional.interpolate(
-            #                 foreground_mask.unsqueeze(0).unsqueeze(0),
-            #                 size=(height, width),
-            #                 mode="nearest",
-            #             ).squeeze(0).squeeze(0)
-            #         fg_loss = self._compute_foreground_loss(
-            #             info=info, mask_gt=foreground_mask, height=height, width=width
-            #         )
-            #         loss += cfg.foreground_lambda * fg_loss
+                fg_loss = torch.tensor(0.0, device=device)
+                if(
+                    cfg.foreground_loss
+                    and step >= cfg.foreground_warmup_steps
+                ):
+                    image_id = image_ids[0].item()
+                    if image_id in self.train_masks:
+                        foreground_mask = self.train_masks[image_id]
+                        # 确保mask尺寸匹配
+                        if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
+                            foreground_mask = torch.nn.functional.interpolate(
+                                foreground_mask.unsqueeze(0).unsqueeze(0),
+                                size=(height, width),
+                                mode="nearest",
+                            ).squeeze(0).squeeze(0)
+                        
+                        # Debug: print info keys at first warmup step
+                        if step == cfg.foreground_warmup_steps:
+                            print(f"[Step {step}] Available info keys: {info.keys()}")
+                            if "gaussian_ids" in info:
+                                print(f"  gaussian_ids shape: {info['gaussian_ids'].shape}")
+                            if "flatten_ids" in info:
+                                print(f"  flatten_ids shape: {info['flatten_ids'].shape}")
+                            if "pixel_ids" in info:
+                                print(f"  pixel_ids shape: {info['pixel_ids'].shape}")
+                        
+                        fg_loss = self._compute_foreground_loss(
+                            info=info, mask_gt=foreground_mask, height=height, width=width
+                        )
+                        
+                        # Only add to loss if computation succeeded
+                        if fg_loss.item() > 0:
+                            loss += cfg.foreground_lambda * fg_loss
+                        elif step == cfg.foreground_warmup_steps:
+                            print(f"Warning: foreground loss is zero at step {step}, check _compute_foreground_loss")
 
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
-            if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
-            # if cfg.foreground_loss and step >= cfg.foreground_warmup_steps:
-            #     desc += f"fg loss={fg_loss.item():.4f}|"
-            if cfg.pose_opt and cfg.pose_noise:
-                # monitor the pose error if we inject noise
-                pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
-                desc += f"pose err={pose_err.item():.6f}| "
+            if is_frozen_mode:
+                # 冻结模式：只显示 foreground loss
+                desc += f"fg loss={fg_loss.item():.4f}| "
+            else:
+                # 正常模式：显示所有 loss
+                if cfg.depth_loss:
+                    desc += f"depth loss={depthloss.item():.6f}| "
+                if cfg.foreground_loss and step >= cfg.foreground_warmup_steps:
+                    desc += f"fg loss={fg_loss.item():.4f}| "
+                if cfg.pose_opt and cfg.pose_noise:
+                    # monitor the pose error if we inject noise
+                    pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
+                    desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
 
             # write images (gt and render)
@@ -1138,18 +1368,25 @@ class Runner:
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
-                self.writer.add_scalar("train/l1loss", l1loss.item(), step)
-                self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
-                if cfg.depth_loss:
-                    self.writer.add_scalar("train/depthloss", depthloss.item(), step)
-                if cfg.use_bilateral_grid:
-                    self.writer.add_scalar("train/tvloss", tvloss.item(), step)
-                if cfg.tb_save_image:
-                    canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-                    canvas = canvas.reshape(-1, *canvas.shape[2:])
-                    self.writer.add_image("train/render", canvas, step)
+                
+                if is_frozen_mode:
+                    # 冻结模式：只记录 foreground loss
+                    self.writer.add_scalar("train/fg_loss", fg_loss.item(), step)
+                else:
+                    # 正常模式：记录所有 loss
+                    self.writer.add_scalar("train/l1loss", l1loss.item(), step)
+                    self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                    if cfg.depth_loss:
+                        self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                    if cfg.use_bilateral_grid:
+                        self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                    if cfg.tb_save_image:
+                        canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
+                        canvas = canvas.reshape(-1, *canvas.shape[2:])
+                        self.writer.add_image("train/render", canvas, step)
+                
                 self.writer.flush()
 
             # save checkpoint before updating the model
@@ -1260,106 +1497,109 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                )
-            else:
-                assert_never(self.cfg.strategy)
+            # 在冻结模式下跳过（只训练 foreground_logits，不需要 densification/pruning）
+            if len(self.optimizers) > 1 or "foreground_logits" not in self.optimizers:
+                if isinstance(self.cfg.strategy, DefaultStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        packed=cfg.packed,
+                    )
+                elif isinstance(self.cfg.strategy, MCMCStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        lr=schedulers[0].get_last_lr()[0],
+                    )
+                else:
+                    assert_never(self.cfg.strategy)
+            # else: 冻结模式，跳过 step_post_backward
 
             # removing mode: remove gaussian ellipsoids landing on the foreground
             # Do this AFTER strategy updates to avoid index issues
-            if cfg.remove_foreground_gaussians and step > 0 and step % cfg.removal_steps == 0:
-                image_id = image_ids[0].item()
-                if image_id in self.train_masks:
-                    foreground_mask = self.train_masks[image_id]  # [H_orig, W_orig]
-                    
-                    # Resize mask to match rendered image size
-                    if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
-                        foreground_mask = torch.nn.functional.interpolate(
-                            foreground_mask.unsqueeze(0).unsqueeze(0),
-                            size=(height, width),
-                            mode='nearest'
-                        ).squeeze(0).squeeze(0)
-                    
-                    # find gaussian ellipsoids landing on the foreground
-                    gaussians_to_remove = self._identify_foreground_gaussians(
-                        info, foreground_mask, height, width
-                    )
-                    
-                    if gaussians_to_remove.any():
-                        num_removed = gaussians_to_remove.sum().item()
-                        print(f"Step {step}: Removing {num_removed} foreground gaussians (total before: {len(self.splats['means'])})")
-                        
-                        # Create keep mask (opposite of remove mask)
-                        keep_mask = ~gaussians_to_remove
-                        
-                        # Manually remove gaussian parameters
-                        for key in self.splats.keys():
-                            self.splats[key] = torch.nn.Parameter(
-                                self.splats[key][keep_mask].detach().clone()
-                            )
-                            self.splats[key].requires_grad_(True)
-                        
-                        # Update optimizers
-                        self._update_optimizers_after_removal(keep_mask)
-                        
-                        # Update strategy_state - CRITICAL for avoiding size mismatch errors
-                        for k, v in self.strategy_state.items():
-                            if isinstance(v, torch.Tensor) and v.shape[0] == len(keep_mask):
-                                self.strategy_state[k] = v[keep_mask]
-                        
-                        print(f"  -> Remaining gaussians: {len(self.splats['means'])}")
-
-
-            # removing mode during training(disabled by default)
-            # if(
-            #     cfg.remove_foreground_gaussians
-            #     and cfg.remove_during_train
-            #     and step > 0
-            #     and step % cfg.removal_steps == 0
-            # ):
+            # if cfg.remove_foreground_gaussians and step > 0 and step % cfg.removal_steps == 0:
             #     image_id = image_ids[0].item()
             #     if image_id in self.train_masks:
-            #         foreground_mask = self.train_masks[image_id]
+            #         foreground_mask = self.train_masks[image_id]  # [H_orig, W_orig]
+                    
+            #         # Resize mask to match rendered image size
             #         if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
             #             foreground_mask = torch.nn.functional.interpolate(
             #                 foreground_mask.unsqueeze(0).unsqueeze(0),
             #                 size=(height, width),
-            #                 mode="nearest",
+            #                 mode='nearest'
             #             ).squeeze(0).squeeze(0)
+                    
+            #         # find gaussian ellipsoids landing on the foreground
             #         gaussians_to_remove = self._identify_foreground_gaussians(
             #             info, foreground_mask, height, width
             #         )
+                    
             #         if gaussians_to_remove.any():
+            #             num_removed = gaussians_to_remove.sum().item()
+            #             print(f"Step {step}: Removing {num_removed} foreground gaussians (total before: {len(self.splats['means'])})")
+                        
+            #             # Create keep mask (opposite of remove mask)
             #             keep_mask = ~gaussians_to_remove
+                        
+            #             # Manually remove gaussian parameters
             #             for key in self.splats.keys():
             #                 self.splats[key] = torch.nn.Parameter(
             #                     self.splats[key][keep_mask].detach().clone()
             #                 )
             #                 self.splats[key].requires_grad_(True)
-            #             self._update_optimizer_after_removal(keep_mask)
+                        
+            #             # Update optimizers
+            #             self._update_optimizers_after_removal(keep_mask)
+                        
+            #             # Update strategy_state - CRITICAL for avoiding size mismatch errors
             #             for k, v in self.strategy_state.items():
             #                 if isinstance(v, torch.Tensor) and v.shape[0] == len(keep_mask):
             #                     self.strategy_state[k] = v[keep_mask]
-            #             print(
-            #                 f"Step {step}: Removed {gaussians_to_remove.sum().item()} gaussians "
-            #                 f"(remaining {len(self.splats['means'])})"
-            #             )
+                        
+            #             print(f"  -> Remaining gaussians: {len(self.splats['means'])}")
+
+
+            # removing mode during training(disabled by default)
+            if(
+                cfg.remove_foreground_gaussians
+                and cfg.remove_during_train
+                and step > 0
+                and step % cfg.removal_steps == 0
+            ):
+                image_id = image_ids[0].item()
+                if image_id in self.train_masks:
+                    foreground_mask = self.train_masks[image_id]
+                    if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
+                        foreground_mask = torch.nn.functional.interpolate(
+                            foreground_mask.unsqueeze(0).unsqueeze(0),
+                            size=(height, width),
+                            mode="nearest",
+                        ).squeeze(0).squeeze(0)
+                    gaussians_to_remove = self._identify_foreground_gaussians(
+                        info, foreground_mask, height, width
+                    )
+                    if gaussians_to_remove.any():
+                        keep_mask = ~gaussians_to_remove
+                        for key in self.splats.keys():
+                            self.splats[key] = torch.nn.Parameter(
+                                self.splats[key][keep_mask].detach().clone()
+                            )
+                            self.splats[key].requires_grad_(True)
+                        self._update_optimizer_after_removal(keep_mask)
+                        for k, v in self.strategy_state.items():
+                            if isinstance(v, torch.Tensor) and v.shape[0] == len(keep_mask):
+                                self.strategy_state[k] = v[keep_mask]
+                        print(
+                            f"Step {step}: Removed {gaussians_to_remove.sum().item()} gaussians "
+                            f"(remaining {len(self.splats['means'])})"
+                        )
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1404,6 +1644,191 @@ class Runner:
         print(f"Compression at step {step} - skipped (not implemented in OR_trainer)")
         pass
 
+    # def _compute_foreground_loss(
+    #         self,
+    #         info: Dict,
+    #         mask_gt: torch.Tensor,
+    #         height: int,
+    #         width: int
+    #     ) -> torch.Tensor:
+    #         if self.cfg.packed:
+    #             # Packed 模式：使用 gaussian_ids 和 pixel_ids
+    #             gaussian_ids = info["gaussian_ids"]  # [nnz]
+    #             if gaussian_ids is None:
+    #                 return torch.tensor(0.0, device=self.device)
+                
+    #             # Prefer flatten_ids with aligns with gaussian_ids in packed mode
+    #             pixel_ids = info.get("flatten_ids", None)  # [nnz]
+    #             if pixel_ids is None:
+    #                 pixel_ids = info.get("pixel_ids", None)
+
+    #             if pixel_ids is None:
+    #                 return torch.tensor(0.0, device=self.device)
+                
+    #             # Ensure size match(nnz)
+    #             if pixel_ids.numel() != gaussian_ids.numel():
+    #                 return torch.tensor(0.0, device=self.device)
+                
+    #             pixel_ids = pixel_ids.view(-1)
+                
+    #             # 将 pixel_ids 转换为 (y, x) 坐标
+    #             y = pixel_ids // width
+    #             x = pixel_ids % width
+                
+    #             # 获取每个高斯球对应像素的 ground truth 前景值
+    #             fg_gt_per_gaussian = mask_gt[y, x]  # [nnz]
+                
+    #             # 获取每个高斯球的前景预测概率
+    #             fg_pred_logits = self.splats["foreground_logits"][gaussian_ids]  # [nnz]
+                
+    #             # 二元交叉熵损失
+    #             loss = F.binary_cross_entropy_with_logits(
+    #                 fg_pred_logits, 
+    #                 fg_gt_per_gaussian,
+    #                 reduction='mean'
+    #             )
+                
+    #         else:
+    #             # 非 Packed 模式：使用 radii
+    #             radii = info["radii"]  # [C, N] C是相机数量，N是高斯球数量
+                
+    #             # 对于每个高斯球，检查它在图像中的可见性
+    #             is_visible = (radii > 0).any(0)  # [N]
+                
+    #             if not is_visible.any():
+    #                 return torch.tensor(0.0, device=self.device)
+                
+    #             # 获取可见高斯球的前景预测
+    #             fg_pred_logits = self.splats["foreground_logits"][is_visible]  # [N_visible]
+                
+    #             # 渲染前景概率图
+    #             # 这里需要使用高斯球的前景概率重新渲染一个前景图
+    #             fg_probs = torch.sigmoid(self.splats["foreground_logits"])  # [N]
+    #             fg_rendered = self._render_foreground_map(info, fg_probs, height, width)
+                
+    #             # 与 ground truth mask 比较
+    #             loss = F.binary_cross_entropy(fg_rendered, mask_gt, reduction='mean')
+            
+    #         return loss
+    
+    def _compute_foreground_loss_BCE_Dice(
+        self,
+        info: Dict,
+        mask_gt: torch.Tensor,
+        height: int,
+        width: int
+    ) -> torch.Tensor:
+        """
+        组合 BCE Loss 和 Dice Loss
+        Combined Loss = alpha * BCE + (1 - alpha) * Dice
+        """
+        bce_weight = 0.5  # 可以在 Config 中配置
+        
+        if self.cfg.packed:
+            gaussian_ids = info.get("gaussian_ids", None)
+            
+            if gaussian_ids is None or gaussian_ids.shape[0] == 0:
+                return torch.tensor(0.0, device=self.device)
+            
+            unique_gaussian_ids = torch.unique(gaussian_ids)
+            max_gaussian_id = len(self.splats["means"]) - 1
+            valid_mask = unique_gaussian_ids <= max_gaussian_id
+            unique_gaussian_ids = unique_gaussian_ids[valid_mask]
+            
+            if unique_gaussian_ids.shape[0] == 0:
+                return torch.tensor(0.0, device=self.device)
+            
+            if "means2d" in info:
+                means2d = info["means2d"]
+                if len(means2d.shape) == 3:
+                    means2d = means2d[0]
+                
+                if unique_gaussian_ids.max() >= means2d.shape[0]:
+                    valid_mask = unique_gaussian_ids < means2d.shape[0]
+                    unique_gaussian_ids = unique_gaussian_ids[valid_mask]
+                
+                if unique_gaussian_ids.shape[0] == 0:
+                    return torch.tensor(0.0, device=self.device)
+                
+                visible_means2d = means2d[unique_gaussian_ids]
+                u = visible_means2d[:, 0].long().clamp(0, width - 1)
+                v = visible_means2d[:, 1].long().clamp(0, height - 1)
+                
+                fg_gt_per_gaussian = mask_gt[v, u]
+                fg_pred_logits = self.splats["foreground_logits"][unique_gaussian_ids]
+                fg_pred_probs = torch.sigmoid(fg_pred_logits)
+                
+                # BCE Loss
+                bce_loss = F.binary_cross_entropy_with_logits(
+                    fg_pred_logits,
+                    fg_gt_per_gaussian,
+                    reduction='mean'
+                )
+                
+                # Dice Loss
+                smooth = 1e-5
+                intersection = (fg_pred_probs * fg_gt_per_gaussian).sum()
+                union = fg_pred_probs.sum() + fg_gt_per_gaussian.sum()
+                dice = (2.0 * intersection + smooth) / (union + smooth)
+                dice_loss = 1.0 - dice
+                
+                # 组合损失
+                loss = bce_weight * bce_loss + (1 - bce_weight) * dice_loss
+                
+                return loss
+            else:
+                avg_mask = mask_gt.mean()
+                fg_pred_logits = self.splats["foreground_logits"][unique_gaussian_ids]
+                loss = F.binary_cross_entropy_with_logits(
+                    fg_pred_logits,
+                    avg_mask.expand_as(fg_pred_logits),
+                    reduction='mean'
+                )
+                return loss
+        else:
+            if "radii" in info and "means2d" in info:
+                radii = info["radii"]
+                means2d = info["means2d"]
+                
+                if len(radii.shape) == 2:
+                    radii_cam0 = radii[0]
+                    means2d_cam0 = means2d[0]
+                else:
+                    radii_cam0 = radii
+                    means2d_cam0 = means2d
+                
+                is_visible = radii_cam0 > 0
+                
+                if not is_visible.any():
+                    return torch.tensor(0.0, device=self.device)
+                
+                visible_means2d = means2d_cam0[is_visible]
+                u = visible_means2d[:, 0].long().clamp(0, width - 1)
+                v = visible_means2d[:, 1].long().clamp(0, height - 1)
+                
+                fg_gt_per_gaussian = mask_gt[v, u]
+                fg_pred_logits = self.splats["foreground_logits"][is_visible]
+                fg_pred_probs = torch.sigmoid(fg_pred_logits)
+                
+                # BCE + Dice
+                bce_loss = F.binary_cross_entropy_with_logits(
+                    fg_pred_logits,
+                    fg_gt_per_gaussian,
+                    reduction='mean'
+                )
+                
+                smooth = 1e-5
+                intersection = (fg_pred_probs * fg_gt_per_gaussian).sum()
+                union = fg_pred_probs.sum() + fg_gt_per_gaussian.sum()
+                dice = (2.0 * intersection + smooth) / (union + smooth)
+                dice_loss = 1.0 - dice
+                
+                loss = bce_weight * bce_loss + (1 - bce_weight) * dice_loss
+                
+                return loss
+            else:
+                return torch.tensor(0.0, device=self.device)
+
     def _compute_foreground_loss(
         self,
         info: Dict,
@@ -1411,67 +1836,129 @@ class Runner:
         height: int,
         width: int
     ) -> torch.Tensor:
+        """
+        Compute binary cross-entropy loss between predicted foreground probability
+        and ground truth mask.
+        
+        Strategy: Use rendered alpha map to weight the supervision signal.
+        For each Gaussian, we supervise it based on where it actually renders.
+        """
         if self.cfg.packed:
-            # Packed 模式：使用 gaussian_ids 和 pixel_ids
-            gaussian_ids = info["gaussian_ids"]  # [nnz]
-            pixel_ids = info["pixel_ids"] # [nnz]
-            # if gaussian_ids is None:
-            #     return torch.tensor(0.0, device=self.device)
+            # In packed mode, we use the gaussian_ids from rasterization
+            # These tell us which Gaussians are visible in this frame
+            gaussian_ids = info.get("gaussian_ids", None)
             
-            # # Prefer flatten_ids with aligns with gaussian_ids in packed mode
-            # pixel_ids = info.get("flatten_ids", None)  # [nnz]
-            # if pixel_ids is None:
-            #     pixel_ids = info.get("pixel_ids", None)
-
-            # if pixel_ids is None:
-            #     return torch.tensor(0.0, device=self.device)
-            
-            # # Ensure size match(nnz)
-            # if pixel_ids.numel() != gaussian_ids.numel():
-            #     return torch.tensor(0.0, device=self.device)
-            
-            # pixel_ids = pixel_ids.view(-1)
-            
-            # 将 pixel_ids 转换为 (y, x) 坐标
-            y = pixel_ids // width
-            x = pixel_ids % width
-            
-            # 获取每个高斯球对应像素的 ground truth 前景值
-            fg_gt_per_gaussian = mask_gt[y, x]  # [nnz]
-            
-            # 获取每个高斯球的前景预测概率
-            fg_pred_logits = self.splats["foreground_logits"][gaussian_ids]  # [nnz]
-            
-            # 二元交叉熵损失
-            loss = F.binary_cross_entropy_with_logits(
-                fg_pred_logits, 
-                fg_gt_per_gaussian,
-                reduction='mean'
-            )
-            
-        else:
-            # 非 Packed 模式：使用 radii
-            radii = info["radii"]  # [C, N] C是相机数量，N是高斯球数量
-            
-            # 对于每个高斯球，检查它在图像中的可见性
-            is_visible = (radii > 0).any(0)  # [N]
-            
-            if not is_visible.any():
+            if gaussian_ids is None or gaussian_ids.shape[0] == 0:
                 return torch.tensor(0.0, device=self.device)
             
-            # 获取可见高斯球的前景预测
-            fg_pred_logits = self.splats["foreground_logits"][is_visible]  # [N_visible]
+            # Get unique Gaussians that are visible
+            unique_gaussian_ids = torch.unique(gaussian_ids)
             
-            # 渲染前景概率图
-            # 这里需要使用高斯球的前景概率重新渲染一个前景图
-            fg_probs = torch.sigmoid(self.splats["foreground_logits"])  # [N]
-            fg_rendered = self._render_foreground_map(info, fg_probs, height, width)
+            # Safety check: filter out invalid indices
+            max_gaussian_id = len(self.splats["means"]) - 1
+            valid_mask = unique_gaussian_ids <= max_gaussian_id
+            unique_gaussian_ids = unique_gaussian_ids[valid_mask]
             
-            # 与 ground truth mask 比较
-            loss = F.binary_cross_entropy(fg_rendered, mask_gt, reduction='mean')
-        
-        return loss
-    
+            if unique_gaussian_ids.shape[0] == 0:
+                return torch.tensor(0.0, device=self.device)
+            
+            # For simplicity: use means2d to get the 2D position of each Gaussian
+            if "means2d" in info:
+                means2d = info["means2d"]  # [C, N, 2] or [N, 2]
+                
+                # If it's [C, N, 2], take first camera
+                if len(means2d.shape) == 3:
+                    means2d = means2d[0]  # [N, 2]
+                
+                # Additional safety check
+                if unique_gaussian_ids.max() >= means2d.shape[0]:
+                    valid_mask = unique_gaussian_ids < means2d.shape[0]
+                    unique_gaussian_ids = unique_gaussian_ids[valid_mask]
+                
+                if unique_gaussian_ids.shape[0] == 0:
+                    return torch.tensor(0.0, device=self.device)
+                
+                # Get positions of visible Gaussians
+                visible_means2d = means2d[unique_gaussian_ids]  # [n_visible, 2]
+                
+                # Convert to pixel coordinates
+                u = visible_means2d[:, 0].long().clamp(0, width - 1)
+                v = visible_means2d[:, 1].long().clamp(0, height - 1)
+                
+                # Sample mask at these locations
+                fg_gt_per_gaussian = mask_gt[v, u]  # [n_visible]
+                
+                # Get predicted logits
+                fg_pred_logits = self.splats["foreground_logits"][unique_gaussian_ids]  # [n_visible]
+
+                assert fg_gt_per_gaussian.shape == fg_pred_logits.shape, \
+                    f"Shape mismatch: gt={fg_gt_per_gaussian.shape}, pred={fg_pred_logits.shape}"
+                
+                # Binary cross-entropy loss
+                loss = F.binary_cross_entropy_with_logits(
+                    fg_pred_logits,
+                    fg_gt_per_gaussian,
+                    reduction='mean'
+                )
+                
+                return loss
+            else:
+                # Fallback: supervise all visible Gaussians with average mask value
+                avg_mask = mask_gt.mean()
+                fg_pred_logits = self.splats["foreground_logits"][unique_gaussian_ids]
+                loss = F.binary_cross_entropy_with_logits(
+                    fg_pred_logits,
+                    avg_mask.expand_as(fg_pred_logits),
+                    reduction='mean'
+                )
+                return loss
+        else:
+            # Non-packed mode: use radii to determine visible Gaussians
+            if "radii" in info and "means2d" in info:
+                radii = info["radii"]  # [C, N]
+                means2d = info["means2d"]  # [C, N, 2]
+                
+                # First camera
+                if len(radii.shape) == 2:
+                    radii_cam0 = radii[0]
+                    means2d_cam0 = means2d[0]
+                else:
+                    radii_cam0 = radii
+                    means2d_cam0 = means2d
+                
+                # Visible Gaussians
+                is_visible = radii_cam0 > 0
+                
+                if not is_visible.any():
+                    return torch.tensor(0.0, device=self.device)
+                
+                # Get their 2D positions
+                visible_means2d = means2d_cam0[is_visible]
+                
+                # Convert to pixel coordinates
+                u = visible_means2d[:, 0].long().clamp(0, width - 1)
+                v = visible_means2d[:, 1].long().clamp(0, height - 1)
+                
+                # Sample mask
+                fg_gt_per_gaussian = mask_gt[v, u]
+                
+                # Get predicted logits
+                fg_pred_logits = self.splats["foreground_logits"][is_visible]
+
+                assert fg_gt_per_gaussian.shape == fg_pred_logits.shape, \
+                    f"Shape mismatch: gt={fg_gt_per_gaussian.shape}, pred={fg_pred_logits.shape}"
+                
+                # BCE loss
+                loss = F.binary_cross_entropy_with_logits(
+                    fg_pred_logits,
+                    fg_gt_per_gaussian,
+                    reduction='mean'
+                )
+                
+                return loss
+            else:
+                return torch.tensor(0.0, device=self.device)
+
     def _render_foreground_map(
         self, 
         info: Dict,
@@ -1519,35 +2006,99 @@ class Runner:
         
         return fg_map
     
-    # @torch.no_grad()
-    # def prune_by_foreground_prob(self):
-    #     """Post-training pruning using learned foreground logits."""
-    #     if not self.cfg.remove_foreground_gaussians:
-    #         return
-    #     fg_prob = torch.sigmoid(self.splats["foreground_logits"])
-    #     keep_mask = fg_prob <= self.cfg.foreground_thresh
-    #     num_remove = (~keep_mask).sum().item()
-    #     if num_remove == 0:
-    #         print("Post-prune: nothing to remove.")
-    #         return
-    #     print(
-    #         f"Post-prune: removing {num_remove} gaussians by prob>{self.cfg.foreground_thresh} "
-    #         f"(before: {len(self.splats['mean'])})"
-    #     )
-    #     for key in list(self.splats.keys()):
-    #         self.splats[key] = torch.nn.Parameter(
-    #             self.splats[key][keep_mask].detach().clone()
-    #         )
-    #         self.splats[key].requires_grad_(True)
-    #     self._update_optimizers_after_removal(keep_mask)
-    #     for k, v in self.strategy_state.items():
-    #         if isinstance(v, torch.Tensor) and v.shape[0] == len(keep_mask):
-    #             self.strategy_state[k] = v[keep_mask]
-    #     print(f"Post-prune: remaining {len(self.splats['mean'])}")
-    #     if self.cfg.post_prune_ckpt:
-    #         data = {"step": "post_prune", "splats": self.splats.state_dict()}
-    #         torch.save(data, f"{self.ckpt_dir}/ckpt_pruned_rank{self.world_rank}.pt")
-    #         print(f"Saved pruned ckpt to {self.chpt_dir}/ckpt_pruned_rank{self.world_rank}.pt")
+    @torch.no_grad()
+    def prune_by_foreground_prob(self):
+        """训练后基于学习的前景概率进行剪枝"""
+        if not self.cfg.remove_foreground_gaussians:
+            print("Post-prune: remove_foreground_gaussians is False, skipping.")
+            return
+        
+        # 计算前景概率
+        fg_prob = torch.sigmoid(self.splats["foreground_logits"])
+        
+        # Debug statistics
+        print(f"Foreground probability statistics:")
+        print(f"  Min: {fg_prob.min().item():.4f}")
+        print(f"  Max: {fg_prob.max().item():.4f}")
+        print(f"  Mean: {fg_prob.mean().item():.4f}")
+        print(f"  Threshold: {self.cfg.foreground_thresh}")
+        
+        # 删除前景高斯球（前景概率高于阈值）
+        # fg_prob 高 = 前景，我们要删除前景，所以删除 fg_prob > thresh
+        keep_mask = fg_prob < self.cfg.foreground_thresh
+        num_remove = (~keep_mask).sum().item()
+        
+        if num_remove == 0:
+            print("Post-prune: nothing to remove (all probs <= threshold).")
+            print("  Hint: Check if foreground_loss was computed during training.")
+            return
+        
+        print(
+            f"Post-prune: removing {num_remove} gaussians by prob>{self.cfg.foreground_thresh} "
+            f"(before: {len(self.splats['means'])})"
+        )
+        
+        # 删除前景高斯球
+        for key in list(self.splats.keys()):
+            self.splats[key] = torch.nn.Parameter(
+                self.splats[key][keep_mask].detach().clone()
+            )
+            self.splats[key].requires_grad_(True)
+        
+        # Update optimizers
+        self._update_optimizers_after_removal(keep_mask)
+        
+        # Update strategy_state
+        for k, v in self.strategy_state.items():
+            if isinstance(v, torch.Tensor) and v.shape[0] == len(keep_mask):
+                self.strategy_state[k] = v[keep_mask]
+        
+        print(f"Post-prune: remaining {len(self.splats['means'])}")
+        
+        # 保存剪枝后的checkpoint
+        if self.cfg.post_prune_ckpt:
+            data = {"step": "post_prune", "splats": self.splats.state_dict()}
+            save_path = f"{self.ckpt_dir}/ckpt_pruned_rank{self.world_rank}.pt"
+            torch.save(data, save_path)
+            print(f"Saved pruned checkpoint to {save_path}")
+
+        if self.cfg.save_ply:
+            self.export_to_ply(step="pruned")
+
+    @torch.no_grad()
+    def export_to_ply(self, step: Union[int, str] = "pruned"):
+        print(f"Exporting to PLY format (step={step})...")
+        # Prepare colors from sh or app module
+        if self.cfg.app_opt:
+            # Evaluate at origin to bake appearance into colors
+            rgb = self.app_module(
+                features=self.splats["features"],
+                embed_ids=None,
+                dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                sh_degree=self.cfg.sh_degree,
+            )
+            rgb = rgb + self.splats["colors"]
+            rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+            sh0 = rgb_to_sh(rgb)
+            shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+        else:
+            sh0 = self.splats["sh0"]
+            shN = self.splats["shN"]
+        
+        # Export
+        export_splats(
+            means=self.splats["means"],
+            scales=self.splats["scales"],
+            quats=self.splats["quats"],
+            opacities=self.splats["opacities"],
+            sh0=sh0,
+            shN=shN,
+            format="ply",
+            save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
+        )
+        
+        print(f"  -> Saved to {self.ply_dir}/point_cloud_{step}.ply")
+        print(f"  -> Number of gaussians: {len(self.splats['means'])}")
 
     def _viewer_render_fn(
         self, camera_state, render_tab_state
@@ -1652,8 +2203,8 @@ def main(local_rank: int, world_rank: int, world_size: int, cfg: Config):
     else:
         # Training mode (including foreground masking/removal mode)
         runner.train()
-        # Post-training pruning based on learned forground probabilities
-        # runner.prune_by_foreground_prob()
+        # 训练后剪枝
+        runner.prune_by_foreground_prob()
 
     if not cfg.disable_viewer:
         runner.viewer.complete()

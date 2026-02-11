@@ -17,6 +17,9 @@ from tqdm import tqdm
 # 3.(Reprojection) P_world + camera parameters(K, R2, t2) -> pixel coordinate(u2, v2)
 # 4.(Propogation segmentation) pixel coordinate(u2, v2) -> SAM -> Mask2
 
+# TODO
+# use depth value to dynamically decide whether selected uv points are valid in a single propagation iteration
+
 from BinaryReader import read_model, get_camera_center_and_rotation, qvec2rotmat, read_colmap_depth
 
 from segment_anything import sam_model_registry, SamPredictor
@@ -272,19 +275,11 @@ def run_propagation(
         base_name = os.path.splitext(next_img_data.name)[0]
         ext = os.path.splitext(next_img_data.name)[1]
         
-        # 1. original file - only mask overlay
-        h, w = next_image.shape[:2]
-        dpi = 100
-        fig = plt.figure(figsize=(w/dpi, h/dpi), dpi=dpi)
-        ax = plt.Axes(fig, [0., 0., 1., 1.])
-        ax.set_axis_off()
-        fig.add_axes(ax)
-        ax.imshow(next_image)
-        masked_overlay = np.ma.masked_where(~current_mask, current_mask.astype(float))
-        ax.imshow(masked_overlay, alpha=0.5, cmap='jet', vmin=0, vmax=1)
-        clean_path = os.path.join(result_path, next_img_data.name)
-        plt.savefig(clean_path, dpi=dpi, pad_inches=0)
-        plt.close(fig)
+        # 1. original file - green screen replacement (chroma key green)
+        green_screen_img = next_image.copy()
+        # Use chroma key green color (0, 177, 64) in RGB
+        green_screen_img[current_mask] = [0, 177, 64]
+        cv2.imwrite(os.path.join(result_path, next_img_data.name), cv2.cvtColor(green_screen_img, cv2.COLOR_RGB2BGR))
         
         # 2. debug file with notations
         fig_debug = plt.figure(figsize=(12, 8))
@@ -670,19 +665,11 @@ def run_propagation_anchor(
         base_name = os.path.splitext(next_img_data.name)[0]
         ext = os.path.splitext(next_img_data.name)[1]
         
-        # 1. original file - only mask overlay
-        h, w = next_image.shape[:2]
-        dpi = 100
-        fig = plt.figure(figsize=(w/dpi, h/dpi), dpi=dpi)
-        ax = plt.Axes(fig, [0., 0., 1., 1.])
-        ax.set_axis_off()
-        fig.add_axes(ax)
-        ax.imshow(next_image)
-        masked_overlay = np.ma.masked_where(~best_mask, best_mask.astype(float))
-        ax.imshow(masked_overlay, alpha=0.5, cmap='jet', vmin=0, vmax=1)
-        clean_path = os.path.join(result_path, next_img_data.name)
-        plt.savefig(clean_path, dpi=dpi, pad_inches=0)
-        plt.close(fig)
+        # 1. original file - green screen replacement (chroma key green)
+        green_screen_img = next_image.copy()
+        # Use chroma key green color (0, 177, 64) in RGB
+        green_screen_img[best_mask] = [0, 177, 64]
+        cv2.imwrite(os.path.join(result_path, next_img_data.name), cv2.cvtColor(green_screen_img, cv2.COLOR_RGB2BGR))
         
         # 2. debug file with notations
         fig_debug = plt.figure(figsize=(12, 8))
@@ -1008,19 +995,11 @@ def run_propagation_with_flow(colmap_path,
         ext = os.path.splitext(next_img_data.name)[1]
 
         # Save result 
-        # 1. original file - only mask overlay
-        h, w = next_image.shape[:2]
-        dpi = 100
-        fig = plt.figure(figsize=(w/dpi, h/dpi), dpi=dpi)
-        ax = plt.Axes(fig, [0., 0., 1., 1.])
-        ax.set_axis_off()
-        fig.add_axes(ax)
-        ax.imshow(next_image)
-        masked_overlay = np.ma.masked_where(~current_mask, current_mask.astype(float))
-        ax.imshow(masked_overlay, alpha=0.5, cmap='jet', vmin=0, vmax=1)
-        clean_path = os.path.join(result_path, next_img_data.name)
-        plt.savefig(clean_path, dpi=dpi, pad_inches=0)
-        plt.close(fig)
+        # 1. original file - green screen replacement (chroma key green)
+        green_screen_img = next_image.copy()
+        # Use chroma key green color (0, 177, 64) in RGB
+        green_screen_img[current_mask] = [0, 177, 64]
+        cv2.imwrite(os.path.join(result_path, next_img_data.name), cv2.cvtColor(green_screen_img, cv2.COLOR_RGB2BGR))
         
         # 2. debug file with notations
         fig_debug = plt.figure(figsize=(12, 8))
@@ -1138,23 +1117,14 @@ def propagation_with_sam2(images_dir,
         # Get mask for object ID 1
         mask = frames_segments[frame_idx][1][0]  # [0] to get first mask dimension
         
-        # original file with mask overlay
-        h, w = image.shape[:2]
-        dpi = 100
-        fig = plt.figure(figsize=(w/dpi, h/dpi), dpi=dpi)
-        ax = plt.Axes(fig, [0., 0., 1., 1.])
-        ax.set_axis_off()
-        fig.add_axes(ax)
-        
-        ax.imshow(image)
-        mask_overlay = np.ma.masked_where(~mask, mask.astype(float))
-        ax.imshow(mask_overlay, alpha=0.5, cmap='jet', vmin=0, vmax=1)
-        
-        clean_path = os.path.join(result_dir, frame_name)
-        plt.savefig(clean_path, dpi=dpi, pad_inches=0)
-        plt.close(fig)
+        # 1. original file - green screen replacement (chroma key green)
+        green_screen_img = image.copy()
+        # Use chroma key green color (0, 177, 64) in RGB
+        green_screen_img[mask] = [0, 177, 64]
+        cv2.imwrite(os.path.join(result_dir, frame_name), cv2.cvtColor(green_screen_img, cv2.COLOR_RGB2BGR))
 
-        # debug file with notations
+        # 2. debug file with notations
+        h, w = image.shape[:2]
         fig_debug = plt.figure(figsize=(12, 8))
         plt.imshow(image)
         masked_overlay_debug = np.ma.masked_where(~mask, mask.astype(float))
@@ -1200,9 +1170,9 @@ if __name__ == "__main__":
     RESULT_PATH = "data/sofa_Marked/images"
     ANCHOR_RESULT_PATH = "data/sofa_Marked_Anchor/images"
     FLOW_RESULT_PATH = "data/sofa_Marked_Flow/images"
-    SAM2_RESULT_PATH = "data/Tree_Marked_Sam2/images"
+    SAM2_RESULT_PATH = "data/STree/mask/Sam2/images_2"
 
-    IMAGES_DIR = "data/Tree/images"
+    IMAGES_DIR = "data/STree/images_2"
 
     USE_COLMAP_DEPTH = True
     if USE_COLMAP_DEPTH:

@@ -1108,7 +1108,7 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
-            # Training loop.
+        # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
@@ -1185,9 +1185,11 @@ class Runner:
 
             # Foreground mask to black: set Gaussians to black where the mask is foreground.
             if cfg.foreground_mask_to_black:
-                image_id = image_ids[0].item()
-                if image_id in self.train_masks:
-                    foreground_mask = self.train_masks[image_id]  # [H_orig, W_orig]
+                # FIX: Correctly map batch image_id to original image_id
+                batch_image_id = image_ids[0].item()
+                actual_image_id = self.trainset.indices[batch_image_id]
+                if actual_image_id in self.train_masks:
+                    foreground_mask = self.train_masks[actual_image_id]  # [H_orig, W_orig]
                     # Resize mask to match rendered image size if needed
                     if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
                         foreground_mask = torch.nn.functional.interpolate(
@@ -1246,40 +1248,37 @@ class Runner:
                 
                 # In frozen mode, start from step 0 (ignore warmup_steps).
                 if cfg.foreground_loss:
-                    image_id = image_ids[0].item()
-                    if image_id in self.train_masks:
-                        foreground_mask = self.train_masks[image_id]
-                        # Ensure mask size matches.
-                        if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
-                            foreground_mask = torch.nn.functional.interpolate(
-                                foreground_mask.unsqueeze(0).unsqueeze(0),
-                                size=(height, width),
-                                mode="nearest",
-                            ).squeeze(0).squeeze(0)
-                        
-                        fg_loss = self._compute_foreground_loss(
-                            camtoworlds=camtoworlds,
-                            Ks=Ks,
-                            mask_gt=foreground_mask,
-                            height=height,
-                            width=width,
-                        )
-                        
-                        if step == 0:
+                    # FIX: Pass image_ids directly, let _compute_foreground_loss handle the mapping
+                    fg_loss = self._compute_foreground_loss(
+                        camtoworlds=camtoworlds,
+                        Ks=Ks,
+                        image_ids=image_ids,
+                        height=height,
+                        width=width,
+                    )
+                    
+                    if step == 0:
+                        batch_image_id = image_ids[0].item()
+                        actual_image_id = self.trainset.indices[batch_image_id]
+                        if actual_image_id in self.train_masks:
+                            foreground_mask = self.train_masks[actual_image_id]
                             print(f"[Frozen Mode] Starting foreground_logits training from step 0")
+                            print(f"  batch_id: {batch_image_id}, actual_id: {actual_image_id}")
                             print(f"  foreground_loss: {fg_loss.item():.6f}")
                             print(f"  mask_gt shape: {foreground_mask.shape}, sum: {foreground_mask.sum().item()}")
                 
--                if fg_loss.item() > 0:
+                if fg_loss.item() > 0:
                     loss = cfg.foreground_lambda * fg_loss
                 else:
                     # No effective foreground loss: create a dummy loss but do not skip.
                     # Skipping could leave the viewer lock unreleased.
                     loss = torch.tensor(0.0, device=device, requires_grad=True)
                     if step == 0:
+                        batch_image_id = image_ids[0].item()
+                        actual_image_id = self.trainset.indices[batch_image_id]
                         print(f"Warning: No valid foreground loss in frozen mode at step {step}")
-                        print(f"  image_id: {image_ids[0].item()}")
-                        print(f"  Has mask: {image_ids[0].item() in self.train_masks}")
+                        print(f"  batch_id: {batch_image_id}, actual_id: {actual_image_id}")
+                        print(f"  Has mask: {actual_image_id in self.train_masks}")
             else:
                 # Normal mode: render loss + foreground loss.
                 l1loss = F.l1_loss(colors, pixels)
@@ -1322,35 +1321,30 @@ class Runner:
                     cfg.foreground_loss
                     and step >= cfg.foreground_warmup_steps
                 ):
-                    image_id = image_ids[0].item()
-                    if image_id in self.train_masks:
-                        foreground_mask = self.train_masks[image_id]
-                        # Ensure mask size matches.
-                        if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
-                            foreground_mask = torch.nn.functional.interpolate(
-                                foreground_mask.unsqueeze(0).unsqueeze(0),
-                                size=(height, width),
-                                mode="nearest",
-                            ).squeeze(0).squeeze(0)
-                        
-                        fg_loss = self._compute_foreground_loss(
-                            camtoworlds=camtoworlds,
-                            Ks=Ks,
-                            mask_gt=foreground_mask,
-                            height=height,
-                            width=width,
-                        )
-                        
-                        # Only add to loss if computation succeeded
-                        if fg_loss.item() > 0:
-                            loss += cfg.foreground_lambda * fg_loss
-                        
-                        # Debug at the first warmup step.
-                        if step == cfg.foreground_warmup_steps:
+                    # FIX: Pass image_ids directly, let _compute_foreground_loss handle the mapping
+                    fg_loss = self._compute_foreground_loss(
+                        camtoworlds=camtoworlds,
+                        Ks=Ks,
+                        image_ids=image_ids,
+                        height=height,
+                        width=width,
+                    )
+                    
+                    # Only add to loss if computation succeeded
+                    if fg_loss.item() > 0:
+                        loss += cfg.foreground_lambda * fg_loss
+                    
+                    # Debug at the first warmup step.
+                    if step == cfg.foreground_warmup_steps:
+                        batch_image_id = image_ids[0].item()
+                        actual_image_id = self.trainset.indices[batch_image_id]
+                        if actual_image_id in self.train_masks:
+                            foreground_mask = self.train_masks[actual_image_id]
                             print(f"[Step {step}] Foreground loss: {fg_loss.item():.6f}")
+                            print(f"  batch_id: {batch_image_id}, actual_id: {actual_image_id}")
                             print(f"  mask_gt shape: {foreground_mask.shape}, sum: {foreground_mask.sum().item()}")
-                        elif fg_loss.item() == 0 and step == cfg.foreground_warmup_steps:
-                            print(f"Warning: foreground loss is zero at step {step}, check implementation")
+                    elif fg_loss.item() == 0 and step == cfg.foreground_warmup_steps:
+                        print(f"Warning: foreground loss is zero at step {step}, check implementation")
 
             loss.backward()
 
@@ -1408,10 +1402,12 @@ class Runner:
                 render_dir = Path(self.cfg.result_dir) / "renders"
                 render_dir.mkdir(exist_ok=True)
                 
-                # Get current training image info.
-                image_id = image_ids[0].item()
-                if image_id in self.train_masks:
-                    foreground_mask = self.train_masks[image_id]
+                # ✅ FIX: Correctly map batch image_id to original image_id
+                batch_image_id = image_ids[0].item()
+                actual_image_id = self.trainset.indices[batch_image_id]
+                
+                if actual_image_id in self.train_masks:
+                    foreground_mask = self.train_masks[actual_image_id]
                     
                     # Ensure mask size matches.
                     if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
@@ -1450,12 +1446,12 @@ class Runner:
                         
                         # Save predicted foreground map (grayscale).
                         pred_img = (predicted_mask.cpu().numpy() * 255).astype(np.uint8)
-                        imageio.imwrite(render_dir / f"fg_pred_step{step:05d}_img{image_id:03d}.png", pred_img)
+                        imageio.imwrite(render_dir / f"fg_pred_step{step:05d}_img{actual_image_id:03d}.png", pred_img)
                         
                         # Save GT mask (only at step 0).
                         if step == 0:
                             gt_img = (foreground_mask.cpu().numpy() * 255).astype(np.uint8)
-                            imageio.imwrite(render_dir / f"fg_gt_img{image_id:03d}.png", gt_img)
+                            imageio.imwrite(render_dir / f"fg_gt_img{actual_image_id:03d}.png", gt_img)
                         
                         # Save comparison (GT on left, prediction on right).
                         gt_np = foreground_mask.cpu().numpy()
@@ -1464,22 +1460,23 @@ class Runner:
                         comp_img = (comparison * 255).astype(np.uint8)
                         
                         # Get actual image filename for naming.
-                        actual_image_name = self.parser.image_names[image_id]
+                        actual_image_name = self.parser.image_names[actual_image_id]
                         actual_base_name = Path(actual_image_name).stem
                         
-                        imageio.imwrite(render_dir / f"fg_compare_step{step:05d}_img{image_id:03d}_{actual_base_name}.png", comp_img)
+                        imageio.imwrite(render_dir / f"fg_compare_step{step:05d}_img{actual_image_id:03d}_{actual_base_name}.png", comp_img)
                         
                         # Print stats.
                         if step % 500 == 0:
                             print(f"\n[Render Debug - Step {step}]")
-                            print(f"  Image ID: {image_id} -> image file: {actual_image_name}")
+                            print(f"  Batch ID: {batch_image_id}, Actual Image ID: {actual_image_id}")
+                            print(f"  Image file: {actual_image_name}")
                             print(f"  Mask file: {actual_base_name}.npy")
                             print(f"  GT mask - sum: {foreground_mask.sum().item():.0f}, mean: {foreground_mask.mean():.4f}")
                             print(f"  Predicted - min: {predicted_mask.min():.4f}, max: {predicted_mask.max():.4f}, mean: {predicted_mask.mean():.4f}")
                             print(f"  Foreground logits - min: {self.splats['foreground_logits'].min():.4f}, max: {self.splats['foreground_logits'].max():.4f}")
                             fg_prob_stats = torch.sigmoid(self.splats["foreground_logits"])
                             print(f"  Foreground prob - >0.9: {(fg_prob_stats > 0.9).sum().item()}, <0.1: {(fg_prob_stats < 0.1).sum().item()}")
-                            print(f"  Saved to: {render_dir / f'fg_compare_step{step:05d}_img{image_id:03d}_{actual_base_name}.png'}")
+                            print(f"  Saved to: {render_dir / f'fg_compare_step{step:05d}_img{actual_image_id:03d}_{actual_base_name}.png'}")
 
             # Save checkpoint before updating the model.
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
@@ -1618,9 +1615,11 @@ class Runner:
                 and step > 0
                 and step % cfg.removal_steps == 0
             ):
-                image_id = image_ids[0].item()
-                if image_id in self.train_masks:
-                    foreground_mask = self.train_masks[image_id]
+                # ✅ FIX: Correctly map batch image_id to original image_id
+                batch_image_id = image_ids[0].item()
+                actual_image_id = self.trainset.indices[batch_image_id]
+                if actual_image_id in self.train_masks:
+                    foreground_mask = self.train_masks[actual_image_id]
                     if foreground_mask.shape[0] != height or foreground_mask.shape[1] != width:
                         foreground_mask = torch.nn.functional.interpolate(
                             foreground_mask.unsqueeze(0).unsqueeze(0),
@@ -1811,7 +1810,7 @@ class Runner:
         self,
         camtoworlds: torch.Tensor,
         Ks: torch.Tensor,
-        mask_gt: torch.Tensor,
+        image_ids: torch.Tensor, 
         height: int,
         width: int,
     ) -> torch.Tensor:
@@ -1822,6 +1821,25 @@ class Runner:
         2. Render these probabilities using Gaussian Splatting
         3. Compare rendered map with ground truth mask
         """
+        
+        # FIX: Correctly map batch image_id to original image_id
+        batch_image_id = image_ids[0].item()  # trainloader index (0-35)
+        actual_image_id = self.trainset.indices[batch_image_id]  # original image ID (0-41, skipping test frames)
+        
+        # Check if mask exists for this image
+        if actual_image_id not in self.train_masks:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Get the mask for this image
+        mask_gt = self.train_masks[actual_image_id]
+        
+        # Ensure mask size matches
+        if mask_gt.shape[0] != height or mask_gt.shape[1] != width:
+            mask_gt = torch.nn.functional.interpolate(
+                mask_gt.unsqueeze(0).unsqueeze(0),
+                size=(height, width),
+                mode="nearest",
+            ).squeeze(0).squeeze(0)
 
         # Convert logits into probability
         fg_probs = torch.sigmoid(self.splats["foreground_logits"])  # [N]

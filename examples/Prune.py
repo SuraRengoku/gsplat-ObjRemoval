@@ -1,7 +1,6 @@
 # type: ignore
-
 """
-usage: python Prune.py --ckpt <checkpoint_path> --threshold <value> [--output <output_dir>] --save_ply
+usage: python Prune.py --ckpt <checkpoint_path> --lthreshold <value> --rthreshold <value> [--output <output_dir>] --save_ply
 """
 
 import argparse
@@ -25,7 +24,7 @@ def load_checkpoint(ckpt_path: str) -> Dict:
     
     return ckpt
 
-def prune_by_threshold(splats: Dict[str, torch.Tensor], threshold: float) -> Dict[str, torch.Tensor]:
+def prune_by_threshold(splats: Dict[str, torch.Tensor], lthreshold: float, rthreshold: float) -> Dict[str, torch.Tensor]:
     """
     prune gaussian ellipsoids based on foreground_logits
     
@@ -64,15 +63,15 @@ def prune_by_threshold(splats: Dict[str, torch.Tensor], threshold: float) -> Dic
         print(f"  [{bins[i]:.1f}, {bins[i+1]:.1f}): {count:8,} ({percentage:5.2f}%)")
     
     # create keep mask(low foreground_logits)
-    keep_mask = fg_prob < threshold
+    keep_mask = (lthreshold <= fg_prob) & (fg_prob <= rthreshold)
     num_remove = (~keep_mask).sum().item()
     num_keep = keep_mask.sum().item()
     
     print(f"\n{'='*80}")
-    print(f"Pruning with threshold = {threshold:.4f}")
+    print(f"Pruning with lthreshold = {lthreshold:.4f} and rthreshold = {rthreshold:.4f}")
     print(f"{'='*80}")
-    print(f"  Gaussians to REMOVE (fg_prob >= {threshold:.4f}): {num_remove:,} ({num_remove/len(fg_prob)*100:.2f}%)")
-    print(f"  Gaussians to KEEP (fg_prob < {threshold:.4f}): {num_keep:,} ({num_keep/len(fg_prob)*100:.2f}%)")
+    print(f"  Gaussians to REMOVE (fg_prob < {lthreshold:.4f} && fg_prob > {rthreshold:.4f}): {num_remove:,} ({num_remove/len(fg_prob)*100:.2f}%)")
+    print(f"  Gaussians to KEEP ({lthreshold:.4f} <= fg_prob <= {rthreshold:.4f}): {num_keep:,} ({num_keep/len(fg_prob)*100:.2f}%)")
     
     if num_remove == 0:
         print("\nWarning: No gaussians will be removed with this threshold!")
@@ -179,10 +178,16 @@ def main():
         help="Path to input checkpoint (e.g., results/Tree/ckpts/ckpt_4999_rank0.pt)"
     )
     parser.add_argument(
-        "--threshold",
+        "--lthreshold",
         type=float,
         required=True,
-        help="Foreground probability threshold. Gaussians with fg_prob >= threshold will be REMOVED."
+        help="Foreground probability left threshold. Gaussians with fg_prob < lthreshold will be REMOVED."
+    )
+    parser.add_argument(
+        "--rthreshold",
+        type=float,
+        required=True,
+        help="Foreground probability right threshold. Gaussians with fg_prob > threshold will be REMOVED."
     )
     parser.add_argument(
         "--output",
@@ -204,7 +209,7 @@ def main():
     args = parser.parse_args()
     
     # check threshold range
-    if not 0.0 <= args.threshold <= 1.0:
+    if not 0.0 <= args.lthreshold <= 1.0 and 0.0 <= args.rthreshold <= 1.0 and args.lthreshold <= args.rthreshold:
         print(f"Error: Threshold must be in range [0.0, 1.0], got {args.threshold}")
         sys.exit(1)
     
@@ -212,24 +217,24 @@ def main():
     ckpt = load_checkpoint(args.ckpt)
     
     # pruning
-    pruned_splats = prune_by_threshold(ckpt["splats"], args.threshold)
+    pruned_splats = prune_by_threshold(ckpt["splats"], args.lthreshold, args.rthreshold)
     
     # store
     if not args.dry_run:
         if args.output is None:
             # default output filename：+ _pruned
             input_path = Path(args.ckpt)
-            output_path = input_path.parent / f"{input_path.stem}_pruned_t{args.threshold:.2f}.pt"
+            output_path = input_path.parent / f"{input_path.stem}_pruned_lt{args.lthreshold:.2f}_rt{args.rthreshold:.2f}.pt"
         else:
             output_path = Path(args.output)
             if output_path.is_dir():
                 # if it is directory, automatically generate filename
                 input_name = Path(args.ckpt).stem
-                output_path = output_path / f"{input_name}_pruned_t{args.threshold:.2f}.pt"
+                output_path = output_path / f"{input_name}_pruned_lt{args.lthreshold:.2f}_rt{args.rthreshold:.2f}.pt"
         
         # create new checkpoint
         pruned_ckpt = {
-            "step": f"pruned_t{args.threshold:.2f}",
+            "step": f"pruned_lt{args.lthreshold:.2f}_rt{args.rthreshold:.2f}",
             "splats": pruned_splats
         }
         

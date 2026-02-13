@@ -1,16 +1,21 @@
 # type: ignore
 
 """
-usage: python examples/OR_trainer2.py \
-        --data_dir data/Tree \
-        --result_dir results/Tree_Removed \
-        --data_factor 2 \
-        --ckpt results/Tree/ckpts/ckpt_29999_rank0.pt \
-        --remove_foreground_gaussians \
-        --foreground_thresh 0.5 \
-        --max_steps 5000 \
-        --mask_type Sam2 \
-        --save_ply
+    python examples/OR_trainer3.py \
+    --data_dir data/Tree \
+    --result_dir results/Tree_Debug \
+    --data_factor 2 \
+    --ckpt results/Tree/ckpts/ckpt_29999_rank0.pt \
+    --max_steps 15000 \
+    --foreground_lambda 2.0 \
+    --foreground_lr 5e-3 \
+    --freeze_scene_params \
+    --mask_type Sam2 \
+    --no-use_soft_labels \
+    --no-use_focal_loss \
+    --no-use_dice_loss \
+    --save_ply \
+    --tb_every 50
 """
 
 import json

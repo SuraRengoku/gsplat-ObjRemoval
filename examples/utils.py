@@ -7,6 +7,7 @@ from torch import Tensor
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
+from scipy.spatial import KDTree
 
 
 class CameraOptModule(torch.nn.Module):
@@ -222,3 +223,23 @@ def apply_depth_colormap(
     if acc is not None:
         img = img * acc + (1.0 - acc)
     return img
+
+@torch.no_grad()
+def K_nearst_neighbors(
+    mean: torch.Tensor, K: int, query: None, return_dist: bool = False
+):
+    mean_np = mean.detach().cpu().numpy()
+    query_np = query.detach().cpu().numpy()
+
+    kdtree = KDTree(mean_np)
+
+    nn_dist, nn_idx = kdtree.query(query_np, k=K)
+
+    nn_dist = torch.from_numpy(nn_dist).to(mean)
+    nn_idx = torch.from_numpy(nn_idx).to(mean.device).to(torch.long)
+
+    if not return_dist:
+        return mean[nn_idx], nn_idx
+    else:
+        return mean[nn_idx], nn_idx, nn_dist
+

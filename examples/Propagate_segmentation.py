@@ -85,6 +85,30 @@ def reproject_point(P_world, K, R_w2c, t_w2c):
 
     return np.array([u, v])
 
+def postprocess_mask(mask, kernal_size=5, close_iterations=2, open_iterations=1):
+    """
+    use morphology operations to fill small holes in the mask
+
+    :param mask: binary mask (numpy mask)
+    :param kernal_size: 
+    :param close_iterations: close operation times (fill the hole)
+    :param open_iterations: open operation times (remove noise)
+
+    Returns:
+    mask file after postprocess
+    """
+
+    # convert into uint8
+    mask_uint8 = (mask > 0).astype(np.uint8) * 255
+    # create morphology kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernal_size, kernal_size))
+    # close
+    mask_cloesd = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel, iterations=close_iterations)
+    # open
+    mask_final = cv2.morphologyEx(mask_cloesd, cv2.MORPH_OPEN, kernel, iterations=open_iterations)
+
+    return mask_final > 127
+
 def run_propagation(
     colmap_path,
     result_path,
@@ -1116,6 +1140,8 @@ def propagation_with_sam2(images_dir,
         
         # Get mask for object ID 1
         mask = frames_segments[frame_idx][1][0]  # [0] to get first mask dimension
+
+        mask = postprocess_mask(mask, kernal_size=5, close_iterations=2, open_iterations=1)
         
         # 1. original file - green screen replacement (chroma key green)
         green_screen_img = image.copy()
@@ -1170,9 +1196,9 @@ if __name__ == "__main__":
     RESULT_PATH = "data/sofa_Marked/images"
     ANCHOR_RESULT_PATH = "data/sofa_Marked_Anchor/images"
     FLOW_RESULT_PATH = "data/sofa_Marked_Flow/images"
-    SAM2_RESULT_PATH = "data/STree/mask/Sam2/images_2"
+    SAM2_RESULT_PATH = "data/FTree/mask/Sam2/images_2"
 
-    IMAGES_DIR = "data/STree/images_2"
+    IMAGES_DIR = "data/FTree/images_2"
 
     USE_COLMAP_DEPTH = True
     if USE_COLMAP_DEPTH:

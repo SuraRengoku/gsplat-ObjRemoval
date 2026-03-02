@@ -9,6 +9,7 @@
     --max_steps 15000 \
     --foreground_lambda 2.0 \
     --foreground_lr 5e-3 \
+    --foreground_entropy_reg 0.01 \
     --freeze_scene_params \
     --mask_type Sam2 \
     --no-use_soft_labels \
@@ -122,6 +123,8 @@ class Config:
     scale_reg: float = 0.0
 
     # foreground loss settings
+    # Note: foreground_logits are randomly initialized in [-1, 1] (sigmoid ~[0.27, 0.73])
+    # instead of 0 (sigmoid=0.5) to break symmetry and help convergence
     foreground_loss: bool = True # whether to use foreground loss
     foreground_lambda: float = 0.1 # foreground loss weights
     foreground_lr: float = 1e-3 # learning rate
@@ -132,6 +135,12 @@ class Config:
     use_soft_labels: bool = True  # Blur GT mask with a Gaussian kernel to create soft labels
     use_focal_loss: bool = True   # Use focal loss to emphasize hard samples
     use_dice_loss: bool = True    # Use Dice loss to improve global consistency
+    
+    # Entropy regularization: encourage foreground_logits to be 0 or 1, not 0.5
+    foreground_entropy_reg: float = 0.01  # entropy regularization weight (0 to disable)
+    foreground_entropy_threshold: float = 0.3 # decision boundry (default 0.3)
+    # If prob > threshold -> push to 1.0 (foreground)
+    # if prob < threshold -> push to 0.0 (background)
 
     foreground_thresh: float = 0.5 
     remove_during_train: bool = False # whether to remove gaussian ellipsoid during train
@@ -231,10 +240,11 @@ def create_splats_with_optimiers(
         # if there is no foreground_logits in checkpoint, add it
         if "foreground_logits" not in checkpoint_splats:
             num_gs = checkpoint_splats["means"].shape[0]
+            # Random initialization: logits in [-1, 1] -> sigmoid in ~[0.27, 0.73]
             checkpoint_splats["foreground_logits"] = torch.nn.Parameter(
-                torch.zeros((num_gs), device=device)
+                torch.rand((num_gs,), device=device) * 2 - 1
             )
-            print(f"Initialized foreground_logits for {num_gs} Gaussians (not in checkpoint)")
+            print(f"Initialized foreground_logits (random) for {num_gs} Gaussians (not in checkpoint)")
 
         if freeze_original_params:
             # Frozen mode: only add foreground_logits to params (used to create optimizers).
@@ -401,8 +411,9 @@ def create_splats_with_optimiers(
         quats = torch.rand((N, 4))
         opacities = torch.logit(torch.full((N,), init_opacity)) 
 
-        # Add foreground parameter; logit(0.5)=0 represents uncertainty.
-        foreground_logits = torch.zeros((N, ))
+        # Random initialization for foreground_logits: logits in [-1, 1] -> sigmoid in ~[0.27, 0.73]
+        # This breaks symmetry and helps training converge better than starting at 0 (sigmoid=0.5)
+        foreground_logits = torch.rand((N,)) * 2 - 1
 
         params = [
             # name, value, lr
@@ -500,10 +511,11 @@ class Runner:
             # If foreground_logits is not in checkpoint, initialize it
             if "foreground_logits" not in checkpoint_splats:
                 num_gs = checkpoint_splats["means"].shape[0]
+                # Random initialization: logits in [-1, 1] -> sigmoid in ~[0.27, 0.73]
                 checkpoint_splats["foreground_logits"] = torch.nn.Parameter(
-                    torch.zeros((num_gs,), device=self.device)
+                    torch.rand((num_gs,), device=self.device) * 2 - 1
                 )
-                print(f"Initialized foreground_logits for {num_gs} Gaussians (not in checkpoint)")
+                print(f"Initialized foreground_logits (random) for {num_gs} Gaussians (not in checkpoint)")
         
         self.splats, self.optimizers = create_splats_with_optimiers(
             self.parser,
@@ -1250,6 +1262,7 @@ class Runner:
                 # Frozen mode: only use foreground loss.
                 # Render loss depends on frozen params and has no gradients.
                 fg_loss = torch.tensor(0.0, device=device)
+                entropy_loss = torch.tensor(0.0, device=device)
                 
                 # In frozen mode, start from step 0 (ignore warmup_steps).
                 if cfg.foreground_loss:
@@ -1262,6 +1275,34 @@ class Runner:
                         width=width,
                     )
                     
+                    # Add entropy regularization to encourage binary foreground_logits
+                    if cfg.foreground_entropy_reg > 0:
+                        fg_probs = torch.sigmoid(self.splats["foreground_logits"])
+                        
+                        # Asymmetric entropy: push away from threshold, not 0.5
+                        # For prob > threshold: penalize (1-p) -> push to 1.0
+                        # Fro prob < threshold: penalize p -> push to 0.0
+                        threshold = cfg.foreground_entropy_threshold
+
+                        # Method 1: Simple distance-based penalty
+                        # entropy = torch.where(
+                        #     fg_prbs > threshold,
+                        #     (1 - fg_probs), # push to 1.0
+                        #     fg_probs        # push to 0.0
+                        # ).mean()
+
+                        # Method 2: Quadratic penalty (smoother, recommanded)
+                        entropy = torch.where(
+                            fg_probs > threshold,
+                            (1 - fg_probs) ** 2, # penalize distance from 1.0
+                            fg_probs ** 2        # penalize distance from 0.0
+                        ).mean()
+
+                        entropy_loss = cfg.foreground_entropy_reg * entropy
+
+                    else:
+                        entropy_loss = torch.tensor(0.0, device=self.device)
+                    
                     if step == 0:
                         batch_image_id = image_ids[0].item()
                         actual_image_id = self.trainset.indices[batch_image_id]
@@ -1270,10 +1311,12 @@ class Runner:
                             print(f"[Frozen Mode] Starting foreground_logits training from step 0")
                             print(f"  batch_id: {batch_image_id}, actual_id: {actual_image_id}")
                             print(f"  foreground_loss: {fg_loss.item():.6f}")
+                            if cfg.foreground_entropy_reg > 0:
+                                print(f"  entropy_loss: {entropy_loss.item():.6f}")
                             print(f"  mask_gt shape: {foreground_mask.shape}, sum: {foreground_mask.sum().item()}")
                 
                 if fg_loss.item() > 0:
-                    loss = cfg.foreground_lambda * fg_loss
+                    loss = cfg.foreground_lambda * fg_loss + entropy_loss
                 else:
                     # No effective foreground loss: create a dummy loss but do not skip.
                     # Skipping could leave the viewer lock unreleased.
@@ -1322,6 +1365,7 @@ class Runner:
                     loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
                 fg_loss = torch.tensor(0.0, device=device)
+                entropy_loss = torch.tensor(0.0, device=device)
                 if(
                     cfg.foreground_loss
                     and step >= cfg.foreground_warmup_steps
@@ -1335,9 +1379,28 @@ class Runner:
                         width=width,
                     )
                     
+                    # Add entropy regularization to encourage binary foreground_logits
+                    if cfg.foreground_entropy_reg > 0:
+                        fg_probs = torch.sigmoid(self.splats["foreground_logits"])
+
+                        # Asymmetric entropy: push away from threshold, not 0.5
+                        threshold = cfg.foreground_entropy_threshold
+
+                        # Quadratic penalty
+                        entropy = torch.where(
+                            fg_probs > threshold, 
+                            (1 - fg_probs) ** 2, # penalize distance from 1.0
+                            fg_probs ** 2        # penalize distance from 0.0
+                        ).mean()
+
+                        entropy_loss = cfg.foreground_entropy_reg * entropy
+                    else:
+                        entropy_loss = torch.tensor(0.0, device=self.device)
+
+                    
                     # Only add to loss if computation succeeded
                     if fg_loss.item() > 0:
-                        loss += cfg.foreground_lambda * fg_loss
+                        loss += cfg.foreground_lambda * fg_loss + entropy_loss
                     
                     # Debug at the first warmup step.
                     if step == cfg.foreground_warmup_steps:
@@ -1346,6 +1409,8 @@ class Runner:
                         if actual_image_id in self.train_masks:
                             foreground_mask = self.train_masks[actual_image_id]
                             print(f"[Step {step}] Foreground loss: {fg_loss.item():.6f}")
+                            if cfg.foreground_entropy_reg > 0:
+                                print(f"  Entropy loss: {entropy_loss.item():.6f}")
                             print(f"  batch_id: {batch_image_id}, actual_id: {actual_image_id}")
                             print(f"  mask_gt shape: {foreground_mask.shape}, sum: {foreground_mask.sum().item()}")
                     elif fg_loss.item() == 0 and step == cfg.foreground_warmup_steps:
@@ -1357,12 +1422,16 @@ class Runner:
             if is_frozen_mode:
                 # Frozen mode: only show foreground loss.
                 desc += f"fg loss={fg_loss.item():.4f}| "
+                if cfg.foreground_entropy_reg > 0:
+                    desc += f"ent={entropy_loss.item():.4f}| "
             else:
                 # Normal mode: show all losses.
                 if cfg.depth_loss:
                     desc += f"depth loss={depthloss.item():.6f}| "
                 if cfg.foreground_loss and step >= cfg.foreground_warmup_steps:
                     desc += f"fg loss={fg_loss.item():.4f}| "
+                    if cfg.foreground_entropy_reg > 0:
+                        desc += f"ent={entropy_loss.item():.4f}| "
                 if cfg.pose_opt and cfg.pose_noise:
                     # Monitor pose error if we inject noise.
                     pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -1387,6 +1456,15 @@ class Runner:
                 if is_frozen_mode:
                     # Frozen mode: log only foreground loss.
                     self.writer.add_scalar("train/fg_loss", fg_loss.item(), step)
+                    if cfg.foreground_entropy_reg > 0:
+                        self.writer.add_scalar("train/entropy_loss", entropy_loss.item(), step)
+                        # Log foreground prob distribution
+                        fg_probs = torch.sigmoid(self.splats["foreground_logits"])
+                        self.writer.add_histogram("train/fg_prob_dist", fg_probs, step)
+                        # Log statistics about uncertain gaussians (near 0.5)
+                        uncertain_mask = (fg_probs > 0.4) & (fg_probs < 0.6)
+                        num_uncertain = uncertain_mask.sum().item()
+                        self.writer.add_scalar("train/num_uncertain_gs", num_uncertain, step)
                 else:
                     # Normal mode: log all losses.
                     self.writer.add_scalar("train/l1loss", l1loss.item(), step)
@@ -1395,6 +1473,17 @@ class Runner:
                         self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                     if cfg.use_bilateral_grid:
                         self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                    if cfg.foreground_loss and step >= cfg.foreground_warmup_steps:
+                        self.writer.add_scalar("train/fg_loss", fg_loss.item(), step)
+                        if cfg.foreground_entropy_reg > 0:
+                            self.writer.add_scalar("train/entropy_loss", entropy_loss.item(), step)
+                            # Log foreground prob distribution
+                            fg_probs = torch.sigmoid(self.splats["foreground_logits"])
+                            self.writer.add_histogram("train/fg_prob_dist", fg_probs, step)
+                            # Log statistics about uncertain gaussians (near 0.5)
+                            uncertain_mask = (fg_probs > 0.4) & (fg_probs < 0.6)
+                            num_uncertain = uncertain_mask.sum().item()
+                            self.writer.add_scalar("train/num_uncertain_gs", num_uncertain, step)
                     if cfg.tb_save_image:
                         canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                         canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -1407,7 +1496,7 @@ class Runner:
                 render_dir = Path(self.cfg.result_dir) / "renders"
                 render_dir.mkdir(exist_ok=True)
                 
-                # ✅ FIX: Correctly map batch image_id to original image_id
+                # FIX: Correctly map batch image_id to original image_id
                 batch_image_id = image_ids[0].item()
                 actual_image_id = self.trainset.indices[batch_image_id]
                 

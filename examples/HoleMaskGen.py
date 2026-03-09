@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import struct
 from scipy.spatial import cKDTree # type: ignore
+from typing import Tuple
 
 def load_gaussian_means(ckpt_path, device="cpu"):
     print(f"loading ckpt: {ckpt_path}")
@@ -43,7 +44,12 @@ def read_colmap_cameras(cam_path):
             cam_id, model_id, width, height = struct.unpack("<iiQQ", f.read(24))
             num_params = CAMERA_MODELS.get(model_id, 4)
             params = struct.unpack("<" + "d" * num_params, f.read(8 * num_params))
-            cameras[cam_id] = {"width": width, "height": height, "params": params}
+            cameras[cam_id] = {
+                "width": width,
+                "height": height,
+                "params": params,
+                "model_id": model_id,
+            }
     
     return cameras
 
@@ -148,6 +154,125 @@ def load_fg_mask(fg_mask_path, H, W):
     if fg_mask_bin.shape != (H, W):
         fg_mask_bin = cv2.resize(fg_mask_bin, (W, H), interpolation=cv2.INTER_NEAREST)
     return fg_mask_bin
+
+
+def _cam_intrinsics_from_colmap_camera(cam: dict) -> Tuple[np.ndarray, int, int]:
+    """
+    Build K from COLMAP binary camera fields.
+    Supported by model_id-based fallback:
+      SIMPLE_PINHOLE(0), PINHOLE(1), SIMPLE_RADIAL(2), RADIAL(3), OPENCV(4), OPENCV_FISHEYE(5), FULL_OPENCV(6)
+    """
+    model_id = int(cam.get("model_id", -1))
+    params = cam["params"]
+    width = int(cam["width"])
+    height = int(cam["height"])
+
+    if model_id in [0, 2, 3]:
+        fx = float(params[0])
+        fy = float(params[0])
+        cx = float(params[1])
+        cy = float(params[2])
+    else:
+        fx = float(params[0])
+        fy = float(params[1]) if len(params) > 1 else float(params[0])
+        cx = float(params[2]) if len(params) > 2 else width * 0.5
+        cy = float(params[3]) if len(params) > 3 else height * 0.5
+
+    K = np.array([
+        [fx, 0.0, cx],
+        [0.0, fy, cy],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    return K, height, width
+
+
+def _build_rays_for_rows(K: np.ndarray, R: np.ndarray, t: np.ndarray, H: int, W: int, row_start: int, row_end: int) -> np.ndarray:
+    """
+    Build world-space rays [N, 6] for image rows [row_start, row_end).
+    COLMAP uses x_cam = R @ x_world + t.
+    """
+    ys, xs = np.meshgrid(
+        np.arange(row_start, row_end, dtype=np.float32),
+        np.arange(W, dtype=np.float32),
+        indexing="ij",
+    )
+    ones = np.ones_like(xs, dtype=np.float32)
+    pix = np.stack([xs, ys, ones], axis=-1).reshape(-1, 3)
+
+    Kinv = np.linalg.inv(K).astype(np.float32)
+    dirs_cam = (pix @ Kinv.T).astype(np.float32)
+    dirs_cam /= (np.linalg.norm(dirs_cam, axis=1, keepdims=True) + 1e-9)
+
+    Rt = R.T.astype(np.float32)
+    dirs_world = (dirs_cam @ Rt.T).astype(np.float32)
+    dirs_world /= (np.linalg.norm(dirs_world, axis=1, keepdims=True) + 1e-9)
+
+    cam_center = (-Rt @ t.reshape(3, 1)).reshape(1, 3).astype(np.float32)
+    origins_world = np.repeat(cam_center, dirs_world.shape[0], axis=0)
+
+    return np.concatenate([origins_world, dirs_world], axis=1).astype(np.float32)
+
+
+def generate_split_surface_masks_from_colmap(
+    split_mesh_path,
+    colmap_dir,
+    output_mask_dir,
+    mask_suffix="_splitmask.png",
+    dilate_size=0,
+    ray_rows_chunk=256,
+):
+    """
+    Reproject split surface mesh to each COLMAP view and output binary masks.
+    """
+    try:
+        import open3d as o3d # type: ignore
+    except Exception as exc:
+        raise ImportError("open3d is required for split surface raycasting masks") from exc
+
+    split_mesh_path = Path(split_mesh_path)
+    colmap_dir = Path(colmap_dir)
+    output_mask_dir = Path(output_mask_dir)
+    output_mask_dir.mkdir(parents=True, exist_ok=True)
+
+    cameras = read_colmap_cameras(colmap_dir / "cameras.bin")
+    images = read_colmap_images(colmap_dir / "images.bin")
+
+    mesh_legacy = o3d.io.read_triangle_mesh(str(split_mesh_path))
+    if mesh_legacy.is_empty():
+        raise RuntimeError(f"Empty mesh: {split_mesh_path}")
+
+    mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh_legacy)
+    scene = o3d.t.geometry.RaycastingScene()
+    _ = scene.add_triangles(mesh_t)
+
+    print(f"[split-mask] mesh: {split_mesh_path}")
+    print(f"[split-mask] mesh triangles: {len(mesh_legacy.triangles):,}")
+    print(f"[split-mask] images: {len(images):,}")
+
+    for _, img in images.items():
+        cam = cameras[img["cam_id"]]
+        K, H, W = _cam_intrinsics_from_colmap_camera(cam)
+        R = qvec2rotmat(img["qvec"]).astype(np.float32)
+        t = np.asarray(img["tvec"], dtype=np.float32)
+
+        mask = np.zeros((H, W), dtype=np.uint8)
+        for row_start in range(0, H, ray_rows_chunk):
+            row_end = min(row_start + ray_rows_chunk, H)
+            rays_np = _build_rays_for_rows(K, R, t, H, W, row_start, row_end)
+            rays = o3d.core.Tensor(rays_np, dtype=o3d.core.Dtype.Float32)
+            hit = scene.cast_rays(rays)
+            t_hit = hit["t_hit"].numpy().reshape(row_end - row_start, W)
+            mask[row_start:row_end] = (np.isfinite(t_hit).astype(np.uint8) * 255)
+
+        if dilate_size and dilate_size > 1:
+            kernel = np.ones((dilate_size, dilate_size), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+
+        out_name = f"{Path(img['name']).stem}{mask_suffix}"
+        out_path = output_mask_dir / out_name
+        cv2.imwrite(str(out_path), mask)
+
+    print(f"[split-mask] saved to: {output_mask_dir}")
 
 
 def build_hole_mask_from_knn(
@@ -293,6 +418,11 @@ if __name__ == "__main__":
     parser.add_argument("--close_ksize", type=int, default=7)
     parser.add_argument("--close_iter", type=int, default=2)
     parser.add_argument("--dilate", type=int, default=3)
+    parser.add_argument("--split_mesh", type=str, default=None, help="optional split surface mesh path (.ply/.obj) for raycast reprojection masks")
+    parser.add_argument("--split_mask_out", type=str, default=None, help="optional output directory for split surface masks")
+    parser.add_argument("--split_mask_suffix", type=str, default="_splitmask.png", help="filename suffix for split-surface masks")
+    parser.add_argument("--split_mask_dilate", type=int, default=0, help="optional dilation size for split-surface masks")
+    parser.add_argument("--split_ray_rows", type=int, default=256, help="raycasting rows per chunk for split-surface reprojection")
 
     args = parser.parse_args()
 
@@ -314,5 +444,21 @@ if __name__ == "__main__":
         close_iter=args.close_iter,
         dilate_size=args.dilate,
     )
+
+    if (args.split_mesh is None) ^ (args.split_mask_out is None):
+        raise ValueError("--split_mesh and --split_mask_out must be provided together")
+
+    if args.split_mesh is not None and args.split_mask_out is not None:
+        if args.split_ray_rows < 1:
+            raise ValueError("--split_ray_rows must be >= 1")
+        generate_split_surface_masks_from_colmap(
+            split_mesh_path=args.split_mesh,
+            colmap_dir=args.colmap,
+            output_mask_dir=args.split_mask_out,
+            mask_suffix=args.split_mask_suffix,
+            dilate_size=args.split_mask_dilate,
+            ray_rows_chunk=args.split_ray_rows,
+        )
+
     print("Done!")
     

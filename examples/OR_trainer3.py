@@ -58,7 +58,6 @@ from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
-from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 @dataclass
 class Config:

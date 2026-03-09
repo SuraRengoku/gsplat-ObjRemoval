@@ -16,17 +16,29 @@ usage: python Prune.py
     [--mesh_method alpha|convex]
     [--mesh_alpha 0.03]
     [--mesh_scale 1.02]
+    [--export_split_surface]
+    [--split_surface_out <path_to_ply>]
+    [--split_voxel_size 0.01]
+    [--split_padding 0.05]
+    [--split_bg_band 0.2]
+    [--split_z_chunk 8]
+    [--split_max_voxels 64000000]
+    [--split_use_fg_mesh_roi]
 """
 
 import argparse
 import torch
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import sys
 import numpy as np
 import open3d as o3d
 from sklearn.cluster import DBSCAN
 from sklearn.neighbors import KDTree
+try:
+    from skimage.measure import marching_cubes
+except Exception:
+    marching_cubes = None
 
 from gsplat import export_splats
 
@@ -387,6 +399,153 @@ def recover_points_inside_mesh_to_foreground(
 
     return move_to_fg
 
+
+def _build_split_sdf_volume(
+    fg_xyz: np.ndarray,
+    bg_xyz: np.ndarray,
+    voxel_size: float,
+    padding: float,
+    bg_band: float,
+    z_chunk: int,
+    max_voxels: int,
+    roi_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Build SDF volume where sdf = d_fg - d_bg.
+    Negative: closer to foreground, Positive: closer to background.
+    """
+    fg_tree = KDTree(fg_xyz)
+
+    if bg_band > 0:
+        d_bg2fg, _ = fg_tree.query(bg_xyz, k=1)
+        d_bg2fg = d_bg2fg[:, 0]
+        bg_use = bg_xyz[d_bg2fg <= bg_band]
+        if bg_use.shape[0] < 1000:
+            bg_use = bg_xyz
+    else:
+        bg_use = bg_xyz
+
+    bg_tree = KDTree(bg_use)
+
+    if roi_bounds is None:
+        pts = np.concatenate([fg_xyz, bg_use], axis=0)
+        pmin = pts.min(axis=0) - padding
+        pmax = pts.max(axis=0) + padding
+    else:
+        pmin = roi_bounds[0] - padding
+        pmax = roi_bounds[1] + padding
+
+    dims = np.ceil((pmax - pmin) / voxel_size).astype(np.int64) + 1
+    nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
+    total_vox = nx * ny * nz
+    if total_vox > max_voxels:
+        raise RuntimeError(
+            f"Split-surface grid too large: {nx}x{ny}x{nz}={total_vox:,} > max_voxels={max_voxels:,}. "
+            "Increase --split_voxel_size or reduce --split_padding/--split_bg_band."
+        )
+
+    print(f"\n{'='*80}")
+    print("Split surface SDF volume:")
+    print(f"{'='*80}")
+    print(f"  Grid: {nx} x {ny} x {nz} ({total_vox:,} voxels)")
+    print(f"  Foreground points: {fg_xyz.shape[0]:,}")
+    print(f"  Background points used: {bg_use.shape[0]:,} / {bg_xyz.shape[0]:,}")
+
+    xs = pmin[0] + np.arange(nx, dtype=np.float32) * voxel_size
+    ys = pmin[1] + np.arange(ny, dtype=np.float32) * voxel_size
+    zs = pmin[2] + np.arange(nz, dtype=np.float32) * voxel_size
+
+    xy = np.stack(np.meshgrid(xs, ys, indexing="ij"), axis=-1).reshape(-1, 2)
+    vol = np.empty((nx, ny, nz), dtype=np.float32)
+
+    for z0 in range(0, nz, z_chunk):
+        z1 = min(z0 + z_chunk, nz)
+        for zi in range(z0, z1):
+            zval = zs[zi]
+            q = np.column_stack([xy, np.full((xy.shape[0],), zval, dtype=np.float32)])
+            d_fg, _ = fg_tree.query(q, k=1)
+            d_bg, _ = bg_tree.query(q, k=1)
+            vol[:, :, zi] = (d_fg[:, 0] - d_bg[:, 0]).reshape(nx, ny).astype(np.float32, copy=False)
+        print(f"  Processed z slices: {z0} -> {z1 - 1}")
+
+    return vol, pmin.astype(np.float32), voxel_size
+
+
+def export_split_surface_mesh(
+    fg_splats: Dict[str, torch.Tensor],
+    bg_splats: Dict[str, torch.Tensor],
+    out_path: str,
+    voxel_size: float,
+    padding: float,
+    bg_band: float,
+    z_chunk: int,
+    max_voxels: int,
+    use_fg_mesh_roi: bool,
+    fg_mesh_method: str,
+    fg_mesh_alpha: float,
+):
+    """
+    Export FG/BG split surface by SDF + Marching Cubes.
+    """
+    if marching_cubes is None:
+        raise ImportError("scikit-image is required for split surface export. Install with: pip install scikit-image")
+
+    fg_xyz = fg_splats["means"].detach().cpu().numpy().astype(np.float32, copy=False)
+    bg_xyz = bg_splats["means"].detach().cpu().numpy().astype(np.float32, copy=False)
+    if fg_xyz.shape[0] < 10 or bg_xyz.shape[0] < 10:
+        raise RuntimeError("Too few points in foreground/background to generate split surface")
+
+    roi_bounds = None
+    if use_fg_mesh_roi:
+        try:
+            fg_mesh, _ = _build_foreground_mesh(fg_xyz, method=fg_mesh_method, alpha=fg_mesh_alpha)
+            if len(fg_mesh.vertices) > 0:
+                verts = np.asarray(fg_mesh.vertices)
+                roi_bounds = (verts.min(axis=0), verts.max(axis=0))
+                print("Using foreground mesh AABB as SDF ROI for acceleration.")
+        except Exception as e:
+            print(f"Warning: failed to build foreground ROI mesh, fallback to point bounds. {e}")
+
+    vol, origin, spacing = _build_split_sdf_volume(
+        fg_xyz=fg_xyz,
+        bg_xyz=bg_xyz,
+        voxel_size=voxel_size,
+        padding=padding,
+        bg_band=bg_band,
+        z_chunk=z_chunk,
+        max_voxels=max_voxels,
+        roi_bounds=roi_bounds,
+    )
+
+    vmin = float(vol.min())
+    vmax = float(vol.max())
+    if not (vmin <= 0.0 <= vmax):
+        raise RuntimeError(f"Level-0 is outside SDF range: min={vmin:.6f}, max={vmax:.6f}")
+
+    verts, faces, _, _ = marching_cubes(vol, level=0.0, spacing=(spacing, spacing, spacing))
+    verts = verts + origin[None, :]
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64, copy=False))
+    mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32, copy=False))
+    mesh.compute_vertex_normals()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    o3d.io.write_triangle_mesh(str(out), mesh)
+
+    print(f"\n{'='*80}")
+    print("Split surface exported:")
+    print(f"{'='*80}")
+    print(f"  Path: {out}")
+    print(f"  Vertices: {len(mesh.vertices):,}")
+    print(f"  Triangles: {len(mesh.triangles):,}")
+    print(f"  Watertight: {mesh.is_watertight()}")
+
 def save_checkpoint(ckpt: Dict, output_path: str):
     """store checkpoint after pruning"""
     output_path = Path(output_path)
@@ -598,6 +757,52 @@ def main():
         default=200000,
         help="(Used with --mesh_recover) chunk size for background occupancy queries."
     )
+    parser.add_argument(
+        "--export_split_surface",
+        action="store_true",
+        help="Export FG/BG closed split surface mesh using SDF + Marching Cubes."
+    )
+    parser.add_argument(
+        "--split_surface_out",
+        type=str,
+        default=None,
+        help="Output path for split surface mesh (.ply). Default: results/.../mesh/*_split_surface.ply"
+    )
+    parser.add_argument(
+        "--split_voxel_size",
+        type=float,
+        default=0.01,
+        help="(Used with --export_split_surface) voxel size for SDF grid."
+    )
+    parser.add_argument(
+        "--split_padding",
+        type=float,
+        default=0.05,
+        help="(Used with --export_split_surface) padding around ROI bounds."
+    )
+    parser.add_argument(
+        "--split_bg_band",
+        type=float,
+        default=0.2,
+        help="(Used with --export_split_surface) keep only background points within this distance to foreground; <=0 means use all background points."
+    )
+    parser.add_argument(
+        "--split_z_chunk",
+        type=int,
+        default=8,
+        help="(Used with --export_split_surface) number of z-slices processed per chunk."
+    )
+    parser.add_argument(
+        "--split_max_voxels",
+        type=int,
+        default=64000000,
+        help="(Used with --export_split_surface) safety cap for voxel count."
+    )
+    parser.add_argument(
+        "--split_use_fg_mesh_roi",
+        action="store_true",
+        help="(Used with --export_split_surface) use foreground mesh AABB as ROI to accelerate SDF volume building."
+    )
 
     args = parser.parse_args()
     
@@ -647,6 +852,22 @@ def main():
 
     if args.mesh_recover and args.mesh_chunk_size < 10000:
         print(f"Error: --mesh_chunk_size must be >= 10000, got {args.mesh_chunk_size}")
+        sys.exit(1)
+
+    if args.export_split_surface and args.split_voxel_size <= 0:
+        print(f"Error: --split_voxel_size must be > 0, got {args.split_voxel_size}")
+        sys.exit(1)
+
+    if args.export_split_surface and args.split_padding < 0:
+        print(f"Error: --split_padding must be >= 0, got {args.split_padding}")
+        sys.exit(1)
+
+    if args.export_split_surface and args.split_z_chunk < 1:
+        print(f"Error: --split_z_chunk must be >= 1, got {args.split_z_chunk}")
+        sys.exit(1)
+
+    if args.export_split_surface and args.split_max_voxels < 1000000:
+        print(f"Error: --split_max_voxels must be >= 1000000, got {args.split_max_voxels}")
         sys.exit(1)
     
     # load checkpoint
@@ -757,6 +978,29 @@ def main():
 
             export_to_ply(fg_splats, str(fg_ply_path))
             export_to_ply(bg_splats, str(bg_ply_path))
+
+        # Export FG/BG split surface if requested
+        if args.export_split_surface:
+            if args.split_surface_out is None:
+                fg_pt_path = Path(fg_output_path)
+                mesh_dir = fg_pt_path.parent.parent / "ply"
+                split_surface_path = mesh_dir / f"{fg_pt_path.stem}_split_surface.ply"
+            else:
+                split_surface_path = Path(args.split_surface_out)
+
+            export_split_surface_mesh(
+                fg_splats=fg_splats,
+                bg_splats=bg_splats,
+                out_path=str(split_surface_path),
+                voxel_size=args.split_voxel_size,
+                padding=args.split_padding,
+                bg_band=args.split_bg_band,
+                z_chunk=args.split_z_chunk,
+                max_voxels=args.split_max_voxels,
+                use_fg_mesh_roi=args.split_use_fg_mesh_roi,
+                fg_mesh_method=args.mesh_method,
+                fg_mesh_alpha=args.mesh_alpha,
+            )
 
     else:
         print(f"\n{'='*80}")

@@ -1,77 +1,785 @@
+# type: ignore
+"""
+Hole-filling for 3DGS via SDS Optimization with Stable Diffusion Inpainting.
+
+Pipeline:
+  1. Load background checkpoint (all parameters frozen).
+  2. Initialize new Gaussians inside the hole region  [TODO: implement].
+  3. For each training step:
+       a. Render RGB images from COLMAP camera poses.
+       b. Retrieve per-view hole masks                [TODO: implement].
+       c. Encode rendered image to latent space, add noise.
+       d. Run SD Inpainting UNet (no-grad) to get noise prediction.
+       e. Compute SDS loss / gradient, apply hole mask.
+       f. Backpropagate into new Gaussians only.
+       g. Densification + boundary regularization.
+  4. Save checkpoint.
+"""
+
 import json
 import math
 import os
-import time 
-from collections import defaultdict
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
-import imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
 import tyro
-import viser
-import yaml
 from datasets.colmap import Dataset, Parser
-from datasets.traj import (
-    generate_ellipse_path_z,
-    generate_interpolated_path,
-    generate_spiral_path,
-)
-
-from fused_ssim import fused_ssim
 from torch import Tensor
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from typing_extensions import assert_never
+from utils import knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
-from gsplat.compression import PngCompression
-from gsplat.distributed import cli
-from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat_viewer import GsplatViewer, GsplatRenderTabState
+from gsplat.optimizers import SelectiveAdam
 
-def get_bg_gaussians():
-	return 
 
-def create_new_gaussians():
-	return 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-def combine_gaussians(bg_gs: torch.Tensor, rd_gs: torch.Tensor):
-	return
+@dataclass
+class Config:
+    # ---- data ----------------------------------------------------------------
+    data_dir: str = "data/kitchen"
+    data_factor: int = 4
+    result_dir: str = "results/kitchen_fill"
+    test_every: int = 8
+    normalize_world_space: bool = True
+    global_scale: float = 1.0
 
-old_gaussians = get_bg_gaussians() # background gaussians from the initial reconstruction
-new_gaussians = create_new_gaussians()  # create some new gaussians near the hole that we want to fill
-all_gaussians = combine_gaussians(old_gaussians, new_gaussians)
+    # ---- checkpoints ---------------------------------------------------------
+    # Path to the *background* checkpoint (.pt produced by OR_trainer / simple_trainer).
+    bg_ckpt: str = ""
 
-optim = Adam(new_gaussians.parameters())  # only the new gaussians will be optimized
+    # ---- new Gaussians -------------------------------------------------------
+    # Number of new Gaussians to place inside the hole.
+    num_new_gs: int = 10_000
+    # Initial opacity (pre-sigmoid value: logit(0.1) ≈ -2.2).
+    init_opacity: float = 0.1
+    # Initial scale multiplier relative to scene scale.
+    init_scale: float = 0.01
 
-for step in range(steps):
-	optim.zero_grad()
-	poses = get_poses()  # k camera poses
-	foreground_masks = get_foreground_masks(poses)  # k foreground masks
-	rendered_images = render_images(all_gaussians, poses)  # k images
-	ts = sample_timesteps()  # k timesteps
-	alpha_ts = get_alphas(ts)  # k correponding alpha values from the noise schedule
-	
-	noise = randn_like(rendered_images)  # k gaussian noise images
-	noisy_images = sqrt(alpha_ts) * rendered_images + sqrt(1 - alpha_ts) * noise  # k noisy rendered images
+    # ---- optimizers ----------------------------------------------------------
+    means_lr: float = 1.6e-4
+    scales_lr: float = 5e-3
+    opacities_lr: float = 5e-2
+    quats_lr: float = 1e-3
+    sh0_lr: float = 2.5e-3
+    shN_lr: float = 2.5e-3 / 20
+    sparse_grad: bool = False
+    visible_adam: bool = False
 
-	with torch.no_grad():
-		pred_noise = diffusion_model(noisy_images, ts)  # k noise predictions
-	
-	sds_loss = mean_squared_error(noise, pred_noise, reduction=None)  # k error images
-	sds_loss = torch.where(foreground_masks, sds_loss, 0)  # set loss to 0 for background pixels
-	sds_loss = sds_loss.mean()
-	
-	sds_loss.backward()
-	optim.zero_grad()
-	
+    # ---- SDS -----------------------------------------------------------------
+    # Hugging-Face model id for the inpainting pipeline.
+    sd_model_id: str = "stabilityai/stable-diffusion-2-inpainting"
+    # Text prompt fed to the inpainting model.
+    prompt: str = "fill content in the mask area based on surrounding information"
+    negative_prompt: str = "artifacts, blurry, low quality"
+    # Minimum / maximum diffusion timestep to sample from.
+    t_min: int = 50
+    t_max: int = 950
+    # SDS loss weight.
+    sds_weight: float = 1.0
+    # VAE latent scale factor (SD default 0.18215).
+    vae_scale_factor: float = 0.18215
+    # Classifier-free guidance scale.
+    guidance_scale: float = 7.5
+
+    # ---- training ------------------------------------------------------------
+    max_steps: int = 5_000
+    batch_size: int = 1
+    sh_degree: int = 3
+    sh_degree_interval: int = 1000
+    near_plane: float = 0.01
+    far_plane: float = 1e10
+    packed: bool = False
+    random_bkgd: bool = False
+
+    # ---- densification -------------------------------------------------------
+    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+        default_factory=DefaultStrategy
+    )
+
+    # ---- regularization ------------------------------------------------------
+    # L2 penalty on scales of new Gaussians to keep them compact.
+    scale_reg: float = 1e-3
+
+    # ---- misc ----------------------------------------------------------------
+    save_steps: List[int] = field(default_factory=lambda: [2_500, 5_000])
+    tb_every: int = 100
+    tb_save_image: bool = False
+    seed: int = 42
+
+    def adjust_steps(self, factor: float) -> None:
+        self.max_steps = int(self.max_steps * factor)
+        self.sh_degree_interval = int(self.sh_degree_interval * factor)
+        strategy = self.strategy
+        if isinstance(strategy, DefaultStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.reset_every     = int(strategy.reset_every     * factor)
+            strategy.refine_every    = int(strategy.refine_every    * factor)
+        elif isinstance(strategy, MCMCStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter  = int(strategy.refine_stop_iter  * factor)
+            strategy.refine_every      = int(strategy.refine_every      * factor)
+
+
+# ---------------------------------------------------------------------------
+# Gaussian utilities
+# ---------------------------------------------------------------------------
+
+def load_bg_splats(ckpt_path: str, device: str) -> torch.nn.ParameterDict:
+    """Load background Gaussians from a .pt checkpoint and freeze all parameters."""
+    print(f"[BG] Loading background checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    splats_state = ckpt["splats"]
+
+    # Build a ParameterDict and freeze every parameter.
+    splats = torch.nn.ParameterDict({
+        k: torch.nn.Parameter(v.to(device), requires_grad=False)
+        for k, v in splats_state.items()
+        if isinstance(v, torch.Tensor)
+    }).to(device)
+
+    print(f"[BG] Loaded {len(splats['means'])} background Gaussians (frozen).")
+    return splats
+
+
+def create_new_splats(
+    num: int,
+    scene_scale: float,
+    sh_degree: int,
+    init_opacity: float,
+    init_scale: float,
+    device: str,
+) -> torch.nn.ParameterDict:
+    """
+    Initialise *new* Gaussians that will be optimised to fill the hole.
+
+    TODO: Replace the random initialisation below with a placement strategy
+          that samples points from *inside* the hole region, e.g.:
+            - Back-project hole pixels from multiple views into 3-D.
+            - Use a visual-hull / voxel intersection of hole masks.
+            - Sample along camera rays that pass through the hole.
+    """
+    print(f"[NEW] Initialising {num} new Gaussians (random placeholder).")
+
+    # Placeholder: uniform random positions within [-scene_scale, scene_scale]^3.
+    means = (torch.rand(num, 3, device=device) * 2 - 1) * scene_scale
+
+    dist = init_scale * scene_scale
+    scales    = torch.full((num, 3), math.log(dist), device=device)
+    quats     = F.normalize(torch.randn(num, 4, device=device), dim=-1)
+    opacities = torch.full(
+        (num,), math.log(init_opacity / (1.0 - init_opacity)), device=device
+    )
+
+    # SH colours: dc band = 0 (grey), higher bands = 0.
+    sh0 = torch.zeros(num, 1, 3, device=device)
+    shN = torch.zeros(num, (sh_degree + 1) ** 2 - 1, 3, device=device)
+
+    splats = torch.nn.ParameterDict({
+        "means":     torch.nn.Parameter(means),
+        "scales":    torch.nn.Parameter(scales),
+        "quats":     torch.nn.Parameter(quats),
+        "opacities": torch.nn.Parameter(opacities),
+        "sh0":       torch.nn.Parameter(sh0),
+        "shN":       torch.nn.Parameter(shN),
+    })
+    return splats
+
+
+def merge_splats_for_render(
+    bg: torch.nn.ParameterDict,
+    new: torch.nn.ParameterDict,
+) -> Dict[str, Tensor]:
+    """
+    Concatenate background (frozen) and new (trainable) Gaussians.
+    The new Gaussians are appended after the background ones; gradient therefore
+    flows only through the new-Gaussian slice of every merged tensor.
+    """
+    merged: Dict[str, Tensor] = {}
+    for key in ("means", "scales", "quats", "opacities"):
+        merged[key] = torch.cat([bg[key].detach(), new[key]], dim=0)
+
+    bg_sh0 = bg["sh0"].detach()
+    bg_shN = bg["shN"].detach()
+    new_sh0 = new["sh0"]
+    new_shN = new["shN"]
+
+    # Pad higher-order SH bands if degrees differ between bg and new.
+    max_bands = max(bg_shN.shape[1], new_shN.shape[1])
+    if bg_shN.shape[1] < max_bands:
+        pad = torch.zeros(bg_shN.shape[0], max_bands - bg_shN.shape[1], 3,
+                          device=bg_shN.device)
+        bg_shN = torch.cat([bg_shN, pad], dim=1)
+    if new_shN.shape[1] < max_bands:
+        pad = torch.zeros(new_shN.shape[0], max_bands - new_shN.shape[1], 3,
+                          device=new_shN.device)
+        new_shN = torch.cat([new_shN, pad], dim=1)
+
+    merged["sh0"] = torch.cat([bg_sh0, new_sh0], dim=0)
+    merged["shN"] = torch.cat([bg_shN, new_shN], dim=0)
+    return merged
+
+
+def create_new_splat_optimizers(
+    splats: torch.nn.ParameterDict,
+    cfg: Config,
+    scene_scale: float,
+) -> Dict[str, torch.optim.Optimizer]:
+    """Create per-parameter optimizers for the new Gaussians only."""
+    BS = cfg.batch_size
+    optimizer_class = (
+        torch.optim.SparseAdam if cfg.sparse_grad
+        else SelectiveAdam       if cfg.visible_adam
+        else torch.optim.Adam
+    )
+
+    param_lrs = [
+        ("means",     cfg.means_lr * scene_scale),
+        ("scales",    cfg.scales_lr),
+        ("quats",     cfg.quats_lr),
+        ("opacities", cfg.opacities_lr),
+        ("sh0",       cfg.sh0_lr),
+        ("shN",       cfg.shN_lr),
+    ]
+
+    optimizers = {
+        name: optimizer_class(
+            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+            eps=1e-15 / math.sqrt(BS),
+            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+        )
+        for name, lr in param_lrs
+    }
+    return optimizers
+
+
+# ---------------------------------------------------------------------------
+# Per-view hole-mask loading
+# ---------------------------------------------------------------------------
+
+def load_hole_masks(
+    parser: Parser,
+    train_indices: List[int],
+    device: str,
+) -> Dict[int, Optional[Tensor]]:
+    """
+    Load per-view binary hole masks.
+    1 = pixel belongs to the hole / inpaint region; 0 = background context.
+
+    TODO: Implement this function.  Options:
+      - Project the 3-D bounding box of the removed object into each camera.
+      - Dilate the OR_trainer foreground masks already saved as .npy files.
+      - Use SAM prompts on the rendered background to detect the empty region.
+
+    Returns:
+        Dict mapping image_id → float Tensor [H, W], or None (= full image).
+    """
+    print("[MASK] WARNING: load_hole_masks is not implemented — "
+          "returning None (full-image) masks as a placeholder.")
+    return {idx: None for idx in train_indices}
+
+
+# ---------------------------------------------------------------------------
+# SDS Optimiser (wraps Stable Diffusion Inpainting)
+# ---------------------------------------------------------------------------
+
+class SDSInpaintOptimizer:
+    """
+    Computes SDS gradients using a frozen SD-Inpainting UNet.
+
+    SDS update direction in latent space::
+
+        d_SDS = w(t) · (ε_θ(z_t, t, y, mask) − ε)
+
+    where ε_θ is the noise predicted by the inpainting UNet conditioned on
+    the text prompt y and the inpaint mask, and ε is the actual noise added.
+    The gradient is masked to zero outside the hole region before being
+    back-propagated through the differentiable rasteriser.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        device: str,
+        dtype: torch.dtype = torch.float16,
+    ) -> None:
+        from diffusers import StableDiffusionInpaintPipeline
+
+        print(f"[SDS] Loading SD Inpainting pipeline: {model_id}")
+        pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            safety_checker=None,
+        ).to(device)
+        pipe.set_progress_bar_config(disable=True)
+
+        self.vae          = pipe.vae
+        self.unet         = pipe.unet
+        self.tokenizer    = pipe.tokenizer
+        self.text_encoder = pipe.text_encoder
+        self.scheduler    = pipe.scheduler
+        self.device       = device
+        self.dtype        = dtype
+
+        # Cache the αᵢ cumulative-product schedule as a device tensor.
+        self.alphas_cumprod: Tensor = self.scheduler.alphas_cumprod.to(device)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _encode_text(self, text: str) -> Tensor:
+        ids = self.tokenizer(
+            text,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.to(self.device)
+        return self.text_encoder(ids)[0]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def get_text_embeddings(
+        self, prompt: str, negative_prompt: str
+    ) -> Tuple[Tensor, Tensor]:
+        """Pre-encode text prompts (call once; re-use every SDS step)."""
+        return self._encode_text(prompt), self._encode_text(negative_prompt)
+
+    def sds_loss(
+        self,
+        rendered: Tensor,
+        mask: Tensor,
+        text_embeds: Tensor,
+        uncond_embeds: Tensor,
+        vae_scale: float,
+        t_min: int,
+        t_max: int,
+        guidance_scale: float = 7.5,
+    ) -> Tensor:
+        """
+        Compute the SDS loss for one rendered view.
+
+        Args:
+            rendered:       Float tensor [B, H, W, 3] ∈ [0, 1].
+            mask:           Float tensor [B, H, W] ∈ {0, 1}  (1 = inpaint).
+            text_embeds:    Conditioned text embeddings  [1, L, D].
+            uncond_embeds:  Unconditional text embeddings [1, L, D].
+            vae_scale:      VAE latent scale factor.
+            t_min / t_max:  Timestep sampling range.
+            guidance_scale: CFG scale.
+
+        Returns:
+            Scalar SDS loss.  Its gradient w.r.t. ``rendered`` equals
+            d_SDS masked to the inpaint region.
+        """
+        B, H, W, _ = rendered.shape
+        latent_h, latent_w = H // 8, W // 8
+
+        # ---- 1. Permute rendered to [B, 3, H, W] ---------------------------
+        img_bchw = rendered.permute(0, 3, 1, 2).contiguous()  # grad flows here
+
+        # ---- 2. Encode rendered image to VAE latent ------------------------
+        #   We encode twice: once with gradient (z) and once without (z_ref
+        #   used inside the noising step, so no second-order gradient leaks).
+        with torch.no_grad():
+            z_ref = (
+                self.vae.encode(img_bchw.to(self.dtype) * 2 - 1)
+                .latent_dist.sample() * vae_scale
+            )  # [B, 4, H/8, W/8]
+
+        # Gradient-carrying encode.
+        z = (
+            self.vae.encode(img_bchw.to(self.dtype) * 2 - 1)
+            .latent_dist.sample() * vae_scale
+        )  # [B, 4, H/8, W/8]
+
+        # ---- 3. Prepare inpainting UNet inputs -----------------------------
+        #   SD-Inpainting UNet expects a 9-channel input:
+        #     [noisy_latent (4) | mask_latent (1) | masked_image_latent (4)]
+
+        # Downsample mask to latent resolution.
+        mask_bchw = mask.unsqueeze(1).float()               # [B, 1, H, W]
+        mask_latent = F.interpolate(
+            mask_bchw, size=(latent_h, latent_w), mode="nearest"
+        ).to(self.dtype)                                     # [B, 1, H/8, W/8]
+
+        # Zero out the inpaint region in the original image, then encode.
+        masked_img = img_bchw.to(self.dtype) * (1.0 - mask_bchw.to(self.dtype))
+        with torch.no_grad():
+            masked_latent = (
+                self.vae.encode(masked_img * 2 - 1)
+                .latent_dist.sample() * vae_scale
+            )  # [B, 4, H/8, W/8]
+
+        # ---- 4. Sample timestep and add noise ------------------------------
+        t = torch.randint(t_min, t_max + 1, (B,), device=self.device, dtype=torch.long)
+        noise   = torch.randn_like(z_ref)
+        alpha_t = self.alphas_cumprod[t].view(B, 1, 1, 1).to(self.dtype)
+        z_t     = torch.sqrt(alpha_t) * z_ref + torch.sqrt(1.0 - alpha_t) * noise
+
+        # ---- 5. UNet noise prediction with classifier-free guidance --------
+        #   Stack uncond + cond embeddings; duplicate latent inputs.
+        text_in   = torch.cat([uncond_embeds, text_embeds], dim=0).to(self.dtype)
+        unet_in   = torch.cat([z_t, mask_latent, masked_latent], dim=1)  # [B, 9, ...]
+        unet_in   = unet_in.repeat(2, 1, 1, 1)                           # [2B, 9, ...]
+
+        with torch.no_grad():
+            noise_pred = self.unet(
+                unet_in,
+                t.repeat(2),
+                encoder_hidden_states=text_in,
+            ).sample  # [2B, 4, H/8, W/8]
+
+        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
+        noise_pred_guided = (
+            noise_pred_uncond
+            + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+        )
+
+        # ---- 6. Compute SDS gradient direction in latent space -------------
+        #
+        #   d_SDS = w(t) · (ε_θ − ε)
+        #
+        #   Weight w(t) = (1 − ᾱ_t) follows the original SDS formulation
+        #   (Poole et al., 2022).  SNR-weighted variants can be substituted.
+        w       = (1.0 - alpha_t)                      # [B, 1, 1, 1]
+        sds_grad = w * (noise_pred_guided.float() - noise.float())  # [B, 4, H/8, W/8]
+
+        # Zero gradient outside the hole region.
+        sds_grad = sds_grad * mask_latent.float()
+
+        # ---- 7. Stop-gradient pseudo-loss ----------------------------------
+        #   Produces  ∇_z L = d_SDS  without computing second-order gradients
+        #   through the UNet (which is frozen and in no-grad mode).
+        loss = (sds_grad.detach() * z).sum()
+        return loss
+
+
+# ---------------------------------------------------------------------------
+# Main Runner
+# ---------------------------------------------------------------------------
+
+class Runner:
+    def __init__(self, cfg: Config, device: str = "cuda") -> None:
+        set_random_seed(cfg.seed)
+        self.cfg    = cfg
+        self.device = device
+
+        # ---- output directories ------------------------------------------
+        for subdir in ("ckpts", "stats", "renders", "ply"):
+            os.makedirs(os.path.join(cfg.result_dir, subdir), exist_ok=True)
+        self.ckpt_dir   = os.path.join(cfg.result_dir, "ckpts")
+        self.stats_dir  = os.path.join(cfg.result_dir, "stats")
+        self.render_dir = os.path.join(cfg.result_dir, "renders")
+        self.ply_dir    = os.path.join(cfg.result_dir, "ply")
+        self.writer     = SummaryWriter(log_dir=os.path.join(cfg.result_dir, "tb"))
+
+        # ---- dataset -------------------------------------------------------
+        self.parser = Parser(
+            data_dir=cfg.data_dir,
+            factor=cfg.data_factor,
+            normalize=cfg.normalize_world_space,
+            test_every=cfg.test_every,
+        )
+        self.trainset    = Dataset(self.parser, split="train")
+        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        print(f"Scene scale: {self.scene_scale:.4f}")
+
+        # ---- Gaussians -------------------------------------------------------
+        # 1. Background (frozen).
+        assert cfg.bg_ckpt, "bg_ckpt must point to the background .pt checkpoint!"
+        self.bg_splats = load_bg_splats(cfg.bg_ckpt, device)
+
+        # 2. New Gaussians (trainable).
+        #    TODO: Replace random init with hole-aware placement.
+        self.new_splats = create_new_splats(
+            num=cfg.num_new_gs,
+            scene_scale=self.scene_scale,
+            sh_degree=cfg.sh_degree,
+            init_opacity=cfg.init_opacity,
+            init_scale=cfg.init_scale,
+            device=device,
+        )
+
+        # 3. Optimizers — only for the new Gaussians.
+        self.optimizers = create_new_splat_optimizers(
+            self.new_splats, cfg, self.scene_scale
+        )
+
+        # ---- Densification strategy -----------------------------------------
+        self._rebuild_combined_splats()
+        cfg.strategy.check_sanity(self.combined_splats, self.optimizers)
+        if isinstance(cfg.strategy, DefaultStrategy):
+            self.strategy_state = cfg.strategy.initialize_state(
+                scene_scale=self.scene_scale
+            )
+        elif isinstance(cfg.strategy, MCMCStrategy):
+            self.strategy_state = cfg.strategy.initialize_state()
+        else:
+            assert_never(cfg.strategy)
+
+        # ---- Hole masks (per view) ------------------------------------------
+        #    TODO: Provide real per-view hole masks once implemented.
+        self.hole_masks: Dict[int, Optional[Tensor]] = load_hole_masks(
+            self.parser, self.trainset.indices, device
+        )
+
+        # ---- SDS module ----------------------------------------------------
+        self.sds = SDSInpaintOptimizer(
+            model_id=cfg.sd_model_id,
+            device=device,
+        )
+        # Pre-encode text — constant throughout training.
+        self.text_embeds, self.uncond_embeds = self.sds.get_text_embeddings(
+            cfg.prompt, cfg.negative_prompt
+        )
+        print(f'[SDS] Prompt: "{cfg.prompt}"')
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _rebuild_combined_splats(self) -> None:
+        """
+        Merge bg + new parameters into self.combined_splats.
+        Called at init and after every densification step.
+        """
+        merged = merge_splats_for_render(self.bg_splats, self.new_splats)
+        self.combined_splats = torch.nn.ParameterDict({
+            k: torch.nn.Parameter(v, requires_grad=v.requires_grad)
+            for k, v in merged.items()
+        })
+
+    def _get_mask(self, image_id: int, height: int, width: int) -> Tensor:
+        """Return float mask [1, H, W] (1 = hole).  Falls back to full image."""
+        raw = self.hole_masks.get(image_id, None)
+        if raw is None:
+            return torch.ones(1, height, width, device=self.device)
+        mask = raw.float().unsqueeze(0)
+        if mask.shape[-2:] != (height, width):
+            mask = F.interpolate(
+                mask.unsqueeze(0), size=(height, width), mode="nearest"
+            ).squeeze(0)
+        return mask.to(self.device)
+
+    def rasterize(
+        self,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        sh_degree: int,
+    ) -> Tensor:
+        """Render the combined (bg + new) Gaussians.  Returns [B, H, W, 3]."""
+        merged = merge_splats_for_render(self.bg_splats, self.new_splats)
+
+        renders, _, _ = rasterization(
+            means=merged["means"],
+            quats=merged["quats"] / merged["quats"].norm(dim=-1, keepdim=True),
+            scales=torch.exp(merged["scales"]),
+            opacities=torch.sigmoid(merged["opacities"]),
+            colors=torch.cat([merged["sh0"], merged["shN"]], dim=1),
+            viewmats=torch.linalg.inv(camtoworlds),
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=sh_degree,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            packed=self.cfg.packed,
+        )
+        return renders[..., :3]  # [B, H, W, 3]
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+
+    def train(self) -> None:
+        cfg        = self.cfg
+        device     = self.device
+        max_steps  = cfg.max_steps
+        global_tic = time.time()
+
+        sh_degree_fn = lambda step: min(cfg.sh_degree, step // cfg.sh_degree_interval)
+
+        data_iter = iter(self.trainset)
+        pbar      = tqdm.tqdm(range(max_steps), desc="SDS Fill")
+
+        for step in pbar:
+            # ---- fetch one training view -----------------------------------
+            try:
+                data = next(data_iter)
+            except StopIteration:
+                data_iter = iter(self.trainset)
+                data      = next(data_iter)
+
+            image_id: int   = data["image_id"].item()
+            camtoworlds     = data["camtoworld"].unsqueeze(0).to(device)  # [1,4,4]
+            Ks              = data["K"].unsqueeze(0).to(device)           # [1,3,3]
+            pixels          = data["image"].unsqueeze(0).to(device)       # [1,H,W,3]
+            height, width   = pixels.shape[1], pixels.shape[2]
+
+            # ---- zero gradients -------------------------------------------
+            for opt in self.optimizers.values():
+                opt.zero_grad()
+
+            # ---- render all Gaussians (bg frozen + new trainable) ----------
+            sh_degree = sh_degree_fn(step)
+            colors    = self.rasterize(camtoworlds, Ks, width, height, sh_degree)
+            # colors: [1, H, W, 3]  ∈ [0, 1],  grad flows through new_splats
+
+            # ---- per-view hole mask ----------------------------------------
+            mask_hw = self._get_mask(image_id, height, width)  # [1, H, W]
+
+            # ---- SDS loss using SD-Inpainting prior ------------------------
+            #
+            #  The full SDS cycle (executed inside sds_loss()):
+            #
+            #  1. Encode rendered image I into latent z via the VAE.
+            #  2. Sample a random timestep t ∈ [t_min, t_max].
+            #  3. Add noise:
+            #       z_t = √ᾱ_t · z  +  √(1−ᾱ_t) · ε,   ε ~ N(0,I)
+            #  4. Concatenate  [z_t | mask | masked-image-z]  →  9-ch input.
+            #  5. Run the frozen UNet with text prompt (CFG):
+            #       ε_θ = UNet(z_t, t, prompt, mask)
+            #  6. Compute the SDS pseudo-gradient:
+            #       d_SDS = w(t) · (ε_θ − ε)           w(t) = (1 − ᾱ_t)
+            #  7. Zero d_SDS outside the hole mask.
+            #  8. Back-propagate through the VAE encoder and rasteriser,
+            #     updating only the new Gaussians.
+            #
+            sds_loss = cfg.sds_weight * self.sds.sds_loss(
+                rendered=colors,
+                mask=mask_hw,
+                text_embeds=self.text_embeds,
+                uncond_embeds=self.uncond_embeds,
+                vae_scale=cfg.vae_scale_factor,
+                t_min=cfg.t_min,
+                t_max=cfg.t_max,
+                guidance_scale=cfg.guidance_scale,
+            )
+
+            # ---- boundary regularization -----------------------------------
+            #   Penalise large scales so new Gaussians stay compact and do
+            #   not "leak" into the frozen background region.
+            reg_loss = cfg.scale_reg * (
+                torch.exp(self.new_splats["scales"]).norm(dim=-1).mean()
+            )
+
+            total_loss = sds_loss + reg_loss
+            total_loss.backward()
+
+            # ---- optimizer step (new Gaussians only) -----------------------
+            for opt in self.optimizers.values():
+                opt.step()
+
+            # ---- densification (optional) ----------------------------------
+            self._rebuild_combined_splats()
+
+            if isinstance(cfg.strategy, DefaultStrategy):
+                cfg.strategy.step_post_backward(
+                    params=self.combined_splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info={
+                        "means2d": None,   # grad-based split disabled (no 2-D means here)
+                        "width":   width,
+                        "height":  height,
+                        "n_cameras": 1,
+                    },
+                    packed=cfg.packed,
+                )
+            elif isinstance(cfg.strategy, MCMCStrategy):
+                cfg.strategy.step_post_backward(
+                    params=self.combined_splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info={},
+                    lr=cfg.means_lr * self.scene_scale,
+                )
+
+            # ---- logging ---------------------------------------------------
+            pbar.set_postfix(
+                sds=f"{sds_loss.item():.4f}",
+                reg=f"{reg_loss.item():.4f}",
+                ngs=len(self.new_splats["means"]),
+            )
+
+            if cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                self.writer.add_scalar("train/sds_loss",   sds_loss.item(),   step)
+                self.writer.add_scalar("train/reg_loss",   reg_loss.item(),   step)
+                self.writer.add_scalar("train/num_new_gs", len(self.new_splats["means"]), step)
+                if cfg.tb_save_image:
+                    canvas = colors[0].detach().cpu().numpy()
+                    self.writer.add_image("train/render", canvas.transpose(2, 0, 1), step)
+                self.writer.flush()
+
+            # ---- checkpoint ------------------------------------------------
+            if step + 1 in cfg.save_steps or step == max_steps - 1:
+                elapsed = time.time() - global_tic
+                stats   = {
+                    "step": step,
+                    "elapsed_s": elapsed,
+                    "num_new_gs": len(self.new_splats["means"]),
+                }
+                with open(
+                    os.path.join(self.stats_dir, f"stats_{step:05d}.json"), "w"
+                ) as f:
+                    json.dump(stats, f, indent=2)
+
+                # Save new Gaussians only.
+                torch.save(
+                    {"step": step, "splats": self.new_splats.state_dict()},
+                    os.path.join(self.ckpt_dir, f"new_gs_{step:05d}.pt"),
+                )
+                # Save the combined (bg + new) checkpoint for downstream use.
+                combined_state = {
+                    k: self.combined_splats[k].detach().cpu()
+                    for k in self.combined_splats
+                }
+                torch.save(
+                    {"step": step, "splats": combined_state},
+                    os.path.join(self.ckpt_dir, f"combined_{step:05d}.pt"),
+                )
+                print(
+                    f"\n[ckpt] step={step}  "
+                    f"new_gs={len(self.new_splats['means'])}  "
+                    f"time={elapsed:.1f}s"
+                )
+
+        print("Training complete.")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(cfg: Config) -> None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    runner = Runner(cfg, device=device)
+    runner.train()
+
+
+if __name__ == "__main__":
+    cfg = tyro.cli(Config)
+    main(cfg)
+

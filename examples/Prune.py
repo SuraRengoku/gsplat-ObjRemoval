@@ -406,6 +406,8 @@ def _build_split_sdf_volume(
     voxel_size: float,
     padding: float,
     bg_band: float,
+    bg_density_radius: float,
+    bg_min_neighbors: int,
     z_chunk: int,
     max_voxels: int,
     roi_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
@@ -419,9 +421,20 @@ def _build_split_sdf_volume(
     if bg_band > 0:
         d_bg2fg, _ = fg_tree.query(bg_xyz, k=1)
         d_bg2fg = d_bg2fg[:, 0]
-        bg_use = bg_xyz[d_bg2fg <= bg_band]
-        if bg_use.shape[0] < 1000:
+        bg_near = bg_xyz[d_bg2fg <= bg_band]
+        if bg_near.shape[0] < 1000:
             bg_use = bg_xyz
+            print("  Warning: too few near-foreground background points, fallback to all background.")
+        else:
+            bg_tree_all = KDTree(bg_xyz)
+            density_counts = bg_tree_all.query_radius(bg_near, r=bg_density_radius, count_only=True)
+            bg_dense = bg_near[density_counts >= bg_min_neighbors]
+
+            if bg_dense.shape[0] < 1000:
+                bg_use = bg_near
+                print("  Warning: too few dense contact points after filtering, fallback to near-foreground background.")
+            else:
+                bg_use = bg_dense
     else:
         bg_use = bg_xyz
 
@@ -449,6 +462,7 @@ def _build_split_sdf_volume(
     print(f"{'='*80}")
     print(f"  Grid: {nx} x {ny} x {nz} ({total_vox:,} voxels)")
     print(f"  Foreground points: {fg_xyz.shape[0]:,}")
+    print(f"  Background density filter: radius={bg_density_radius}, min_neighbors={bg_min_neighbors}")
     print(f"  Background points used: {bg_use.shape[0]:,} / {bg_xyz.shape[0]:,}")
 
     xs = pmin[0] + np.arange(nx, dtype=np.float32) * voxel_size
@@ -478,6 +492,8 @@ def export_split_surface_mesh(
     voxel_size: float,
     padding: float,
     bg_band: float,
+    bg_density_radius: float,
+    bg_min_neighbors: int,
     z_chunk: int,
     max_voxels: int,
     use_fg_mesh_roi: bool,
@@ -512,6 +528,8 @@ def export_split_surface_mesh(
         voxel_size=voxel_size,
         padding=padding,
         bg_band=bg_band,
+        bg_density_radius=bg_density_radius,
+        bg_min_neighbors=bg_min_neighbors,
         z_chunk=z_chunk,
         max_voxels=max_voxels,
         roi_bounds=roi_bounds,
@@ -787,6 +805,18 @@ def main():
         help="(Used with --export_split_surface) keep only background points within this distance to foreground; <=0 means use all background points."
     )
     parser.add_argument(
+        "--split_bg_density_radius",
+        type=float,
+        default=0.02,
+        help="(Used with --export_split_surface) local background density radius for filtering floating outlier points near foreground."
+    )
+    parser.add_argument(
+        "--split_bg_min_neighbors",
+        type=int,
+        default=10,
+        help="(Used with --export_split_surface) minimum background neighbors within --split_bg_density_radius to keep a near-foreground background point."
+    )
+    parser.add_argument(
         "--split_z_chunk",
         type=int,
         default=8,
@@ -868,6 +898,14 @@ def main():
 
     if args.export_split_surface and args.split_max_voxels < 1000000:
         print(f"Error: --split_max_voxels must be >= 1000000, got {args.split_max_voxels}")
+        sys.exit(1)
+
+    if args.export_split_surface and args.split_bg_density_radius <= 0:
+        print(f"Error: --split_bg_density_radius must be > 0, got {args.split_bg_density_radius}")
+        sys.exit(1)
+
+    if args.export_split_surface and args.split_bg_min_neighbors < 1:
+        print(f"Error: --split_bg_min_neighbors must be >= 1, got {args.split_bg_min_neighbors}")
         sys.exit(1)
     
     # load checkpoint
@@ -995,6 +1033,8 @@ def main():
                 voxel_size=args.split_voxel_size,
                 padding=args.split_padding,
                 bg_band=args.split_bg_band,
+                bg_density_radius=args.split_bg_density_radius,
+                bg_min_neighbors=args.split_bg_min_neighbors,
                 z_chunk=args.split_z_chunk,
                 max_voxels=args.split_max_voxels,
                 use_fg_mesh_roi=args.split_use_fg_mesh_roi,

@@ -1708,7 +1708,7 @@ class Runner:
                 and step > 0
                 and step % cfg.removal_steps == 0
             ):
-                # ✅ FIX: Correctly map batch image_id to original image_id
+                # FIX: Correctly map batch image_id to original image_id
                 batch_image_id = image_ids[0].item()
                 actual_image_id = self.trainset.indices[batch_image_id]
                 if actual_image_id in self.train_masks:

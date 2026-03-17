@@ -1,21 +1,4 @@
 # type: ignore
-"""
-Hole-filling for 3DGS via SDS Optimization with Stable Diffusion Inpainting.
-
-Pipeline:
-  1. Load background checkpoint (all parameters frozen).
-  2. Initialize new Gaussians inside the hole region  [TODO: implement].
-  3. For each training step:
-       a. Render RGB images from COLMAP camera poses.
-       b. Retrieve per-view hole masks                [TODO: implement].
-       c. Encode rendered image to latent space, add noise.
-       d. Run SD Inpainting UNet (no-grad) to get noise prediction.
-       e. Compute SDS loss / gradient, apply hole mask.
-       f. Backpropagate into new Gaussians only.
-       g. Densification + boundary regularization.
-  4. Save checkpoint.
-"""
-
 import json
 import math
 import os
@@ -56,8 +39,9 @@ class Config:
     global_scale: float = 1.0
 
     # ---- checkpoints ---------------------------------------------------------
-    # Path to the *background* checkpoint (.pt produced by OR_trainer / simple_trainer).
+    # Path to the *background* and "foreground" checkpoint (.pt produced by OR_trainer / simple_trainer).
     bg_ckpt: str = ""
+    fg_ckpt: str = ""
 
     # ---- new Gaussians -------------------------------------------------------
     # Number of new Gaussians to place inside the hole.
@@ -83,9 +67,12 @@ class Config:
     # Text prompt fed to the inpainting model.
     prompt: str = "fill content in the mask area based on surrounding information"
     negative_prompt: str = "artifacts, blurry, low quality"
-    # Minimum / maximum diffusion timestep to sample from.
-    t_min: int = 50
-    t_max: int = 950
+    # Timestep sampling range expressed as a *fraction* of the scheduler's
+    # total timesteps (T_max).  DreamFusion uses [0.02, 0.98]; the supervisor
+    # found [0.2, 0.6] produces sharper results by avoiding very high-noise
+    # steps that contribute only blurry gradients.
+    t_min: float = 0.2
+    t_max: float = 0.6
     # SDS loss weight.
     sds_weight: float = 1.0
     # VAE latent scale factor (SD default 0.18215).
@@ -143,11 +130,13 @@ def load_bg_splats(ckpt_path: str, device: str) -> torch.nn.ParameterDict:
     ckpt = torch.load(ckpt_path, map_location=device)
     splats_state = ckpt["splats"]
 
-    # Build a ParameterDict and freeze every parameter.
+    # Build a ParameterDict, freeze every parameter, and drop foreground_logits
+    # (only needed during object-removal training, not during hole filling).
+    EXCLUDE = {"foreground_logits"}
     splats = torch.nn.ParameterDict({
         k: torch.nn.Parameter(v.to(device), requires_grad=False)
         for k, v in splats_state.items()
-        if isinstance(v, torch.Tensor)
+        if isinstance(v, torch.Tensor) and k not in EXCLUDE
     }).to(device)
 
     print(f"[BG] Loaded {len(splats['means'])} background Gaussians (frozen).")
@@ -197,6 +186,46 @@ def create_new_splats(
     })
     return splats
 
+def create_new_splats_with_fg(ckpt_path: str, device: str) -> torch.nn.ParameterDict:
+    """
+    Load foreground Gaussians from a .pt checkpoint as the initial set of new
+    (trainable) Gaussians for hole filling.
+
+    All geometric and colour parameters are copied from the checkpoint and set
+    as trainable.  Opacities are reset to nearly zero so the Gaussians are
+    effectively invisible at the start of training and must be "grown" by the
+    SDS optimiser rather than immediately polluting the render.
+
+    Nearly-zero opacity in logit space: logit(ε) = log(ε / (1-ε)).
+    Using ε = 0.005  →  logit ≈ -5.3.
+    """
+    NEAR_ZERO_OPACITY = 0.005  # sigmoid(-5.3) ≈ 0.005
+    EXCLUDE = {"foreground_logits"}
+
+    print(f"[FG] Loading foreground checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    splats_state = ckpt["splats"]
+
+    # Load all parameters except foreground_logits; make them trainable.
+    splats = torch.nn.ParameterDict({
+        k: torch.nn.Parameter(v.to(device), requires_grad=True)
+        for k, v in splats_state.items()
+        if isinstance(v, torch.Tensor) and k not in EXCLUDE
+    }).to(device)
+
+    # Override opacities with near-zero values (in logit / pre-sigmoid space).
+    num_gs = splats["means"].shape[0]
+    init_logit = math.log(NEAR_ZERO_OPACITY / (1.0 - NEAR_ZERO_OPACITY))
+    splats["opacities"] = torch.nn.Parameter(
+        torch.full((num_gs,), init_logit, device=device),
+        requires_grad=True,
+    )
+
+    print(
+        f"[FG] Loaded {num_gs} foreground Gaussians as trainable new splats "
+        f"(opacity reset to {NEAR_ZERO_OPACITY})."
+    )
+    return splats
 
 def merge_splats_for_render(
     bg: torch.nn.ParameterDict,
@@ -301,7 +330,7 @@ class SDSInpaintOptimizer:
 
     SDS update direction in latent space::
 
-        d_SDS = w(t) · (ε_θ(z_t, t, y, mask) − ε)
+        d_SDS = w(t) · (ε_θ(z_t, t, y, mask) - ε)
 
     where ε_θ is the noise predicted by the inpainting UNet conditioned on
     the text prompt y and the inpaint mask, and ε is the actual noise added.
@@ -369,8 +398,8 @@ class SDSInpaintOptimizer:
         text_embeds: Tensor,
         uncond_embeds: Tensor,
         vae_scale: float,
-        t_min: int,
-        t_max: int,
+        t_min: float,
+        t_max: float,
         guidance_scale: float = 7.5,
     ) -> Tensor:
         """
@@ -382,7 +411,8 @@ class SDSInpaintOptimizer:
             text_embeds:    Conditioned text embeddings  [1, L, D].
             uncond_embeds:  Unconditional text embeddings [1, L, D].
             vae_scale:      VAE latent scale factor.
-            t_min / t_max:  Timestep sampling range.
+            t_min / t_max:  Timestep range as *fractions* of T_max, e.g. 0.2 / 0.6.
+                            Converted to integer indices internally.
             guidance_scale: CFG scale.
 
         Returns:
@@ -429,7 +459,11 @@ class SDSInpaintOptimizer:
             )  # [B, 4, H/8, W/8]
 
         # ---- 4. Sample timestep and add noise ------------------------------
-        t = torch.randint(t_min, t_max + 1, (B,), device=self.device, dtype=torch.long)
+        # Convert fractional t_min / t_max to integer indices.
+        T = self.scheduler.config.num_train_timesteps  # typically 1000
+        t_lo = max(1,   int(t_min * T))
+        t_hi = min(T-1, int(t_max * T))
+        t = torch.randint(t_lo, t_hi + 1, (B,), device=self.device, dtype=torch.long)
         noise   = torch.randn_like(z_ref)
         alpha_t = self.alphas_cumprod[t].view(B, 1, 1, 1).to(self.dtype)
         z_t     = torch.sqrt(alpha_t) * z_ref + torch.sqrt(1.0 - alpha_t) * noise
@@ -509,14 +543,17 @@ class Runner:
 
         # 2. New Gaussians (trainable).
         #    TODO: Replace random init with hole-aware placement.
-        self.new_splats = create_new_splats(
-            num=cfg.num_new_gs,
-            scene_scale=self.scene_scale,
-            sh_degree=cfg.sh_degree,
-            init_opacity=cfg.init_opacity,
-            init_scale=cfg.init_scale,
-            device=device,
-        )
+        # self.new_splats = create_new_splats(
+        #     num=cfg.num_new_gs,
+        #     scene_scale=self.scene_scale,
+        #     sh_degree=cfg.sh_degree,
+        #     init_opacity=cfg.init_opacity,
+        #     init_scale=cfg.init_scale,
+        #     device=device,
+        # )
+        
+		# 2. Reuse the foreground Gaussians as the seed 
+        self.new_splats = create_new_splats_with_fg(cfg.fg_ckpt, device)
 
         # 3. Optimizers — only for the new Gaussians.
         self.optimizers = create_new_splat_optimizers(
@@ -551,10 +588,6 @@ class Runner:
             cfg.prompt, cfg.negative_prompt
         )
         print(f'[SDS] Prompt: "{cfg.prompt}"')
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _rebuild_combined_splats(self) -> None:
         """
@@ -606,12 +639,25 @@ class Runner:
             packed=self.cfg.packed,
         )
         return renders[..., :3]  # [B, H, W, 3]
-
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
-
+        
     def train(self) -> None:
+        """
+        Hole-filling for 3DGS via SDS Optimization with Stable Diffusion Inpainting.
+
+        Pipeline:
+        1. Load background checkpoint (all parameters frozen).
+        2. Initialize new Gaussians inside the hole region  [TODO: implement or maybe deprecate].
+		   Initialize new Gaussians by setting the original foreground Gaussians' opacity close to 0
+        3. For each training step:
+            a. Render RGB images from COLMAP camera poses.
+            b. Retrieve per-view hole masks                [TODO: implement].
+            c. Encode rendered image to latent space, add noise.
+            d. Run SD Inpainting UNet (no-grad) to get noise prediction.
+            e. Compute SDS loss / gradient, apply hole mask.
+            f. Backpropagate into new Gaussians only.
+            g. Densification + boundary regularization.
+        4. Save checkpoint.
+        """
         cfg        = self.cfg
         device     = self.device
         max_steps  = cfg.max_steps
@@ -636,7 +682,6 @@ class Runner:
             pixels          = data["image"].unsqueeze(0).to(device)       # [1,H,W,3]
             height, width   = pixels.shape[1], pixels.shape[2]
 
-            # ---- zero gradients -------------------------------------------
             for opt in self.optimizers.values():
                 opt.zero_grad()
 

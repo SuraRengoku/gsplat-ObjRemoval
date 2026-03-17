@@ -1,18 +1,34 @@
+# type:ignore
+
+"""
+Usage: python HoleMaskGen2.py
+	--ckpt 
+	--fg_mesh 
+	--colmap_dir
+	--output
+	--device
+	[--near_plane]
+	[--far_plane]
+	[--camera_model]
+	--packed
+"""
+
 import argparse
 import os
 import struct
 from pathlib import Path
-from typing import Dict, Literal, Tuple
+from typing import Dict, Literal, Tuple, Optional
 
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import open3d as o3d
 from tqdm import tqdm
 
 from datasets.colmap import Parser
 from gsplat.rendering import rasterization
 import matplotlib.pyplot as plt
-
+import trimesh
 
 def normalize_to_uint8(image: np.ndarray) -> np.ndarray:
 	img_min = float(np.min(image))
@@ -51,9 +67,36 @@ def load_splats(ckpt_path: Path, device: torch.device) -> Dict[str, torch.Tensor
 	}
 
 
+def _build_rays(K: np.ndarray, R: np.ndarray, t: np.ndarray, H: int, W: int) -> np.ndarray:
+	"""
+	Build world-space rays [H, W, 6] for image.
+	COLMAP uses x_cam = R @ x_world + t.
+	"""
+	ys, xs = np.meshgrid(
+		np.arange(H, dtype=np.float32),
+		np.arange(W, dtype=np.float32),
+		indexing="ij",
+	)
+	ones = np.ones_like(xs, dtype=np.float32)
+	pix = np.stack([xs, ys, ones], axis=-1).reshape(-1, 3)
+
+	Kinv = np.linalg.inv(K).astype(np.float32)
+	dirs_cam = (pix @ Kinv.T).astype(np.float32)
+	dirs_cam /= (np.linalg.norm(dirs_cam, axis=1, keepdims=True) + 1e-9)
+
+	Rt = R.T.astype(np.float32)
+	dirs_world = (dirs_cam @ Rt.T).astype(np.float32)
+	dirs_world /= (np.linalg.norm(dirs_world, axis=1, keepdims=True) + 1e-9)
+
+	cam_center = (-Rt @ t.reshape(3, 1)).reshape(1, 3).astype(np.float32)
+	origins_world = np.repeat(cam_center, dirs_world.shape[0], axis=0)
+
+	return np.concatenate([origins_world, dirs_world], axis=1).astype(np.float32)
+
 @torch.no_grad()
 def render_all_views(
 	ckpt_path: Path,
+	fg_mesh_path: Optional[Path],
 	colmap_dir: Path,
 	output_dir: Path,
 	device: torch.device,
@@ -70,6 +113,21 @@ def render_all_views(
 		test_every=8,
 	)
 	splats = load_splats(ckpt_path, device=device)
+	if fg_mesh_path is not None:
+		try:
+			mesh_legacy = o3d.io.read_triangle_mesh(str(fg_mesh_path))
+			if mesh_legacy.is_empty():
+				raise RuntimeError(f"Empty mesh: {fg_mesh_path}")
+			mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh_legacy)
+			raycaster = o3d.t.geometry.RaycastingScene()
+			raycaster.add_triangles(mesh_t)
+		except Exception as e:
+			print(f"[Warning] Failed to load foreground mesh or open3d. Fallback to None. Error: {e}")
+			raycaster = None
+		fgmask_dir = output_dir / "fgmask"
+		fgmask_dir.mkdir(parents=True, exist_ok=True)
+	else:
+		raycaster = None
 
 	alpha_dir = output_dir / "alpha"
 	depth_dir = output_dir / "depth"
@@ -117,9 +175,10 @@ def render_all_views(
 		plt.imsave(alpha_dir / f"{stem}.png", alpha_uint8)
 
 		depth = render_depth[0, ..., 0].cpu().numpy()
-		np.save(depth_dir / f"{stem}.npy", depth)
+		np.save(depth_dir / f"{stem}.npy", depth.astype(np.float64))
 
 		depth_uint16 = (depth * 1000).astype(np.uint16)
+		imageio.imwrite(depth_dir / f"{stem}_16bit.png", depth_uint16)
 		
 		valid_mask = depth > 0
 		if valid_mask.any():
@@ -130,10 +189,29 @@ def render_all_views(
 			depth_vis = depth
 
 		plt.imsave(depth_dir / f"{stem}.png", depth_vis, cmap='turbo')
+
+		if raycaster is not None:
+			w2c = viewmats[0].cpu().numpy()
+			R = w2c[:3, :3]
+			t = w2c[:3, 3]
+			
+			rays_np = _build_rays(k, R, t, height, width)
+			rays_np = rays_np.reshape(height, width, 6)
+			
+			rays = o3d.core.Tensor(rays_np, dtype=o3d.core.Dtype.Float32)
+			hit = raycaster.cast_rays(rays)
+			t_hit = hit["t_hit"].numpy()
+			
+			fgmask = np.isfinite(t_hit).astype(np.uint8)
+			
+			np.save(fgmask_dir / f"{stem}.npy", fgmask)
+			imageio.imwrite(fgmask_dir / f"{stem}.png", fgmask * 255)
 		
 	print("[Done] Render finished.")
 	print(f"[Done] alpha maps: {alpha_dir}")
 	print(f"[Done] depth maps: {depth_dir}")
+	if raycaster is not None:
+		print(f"[Done] fgmask maps: {fgmask_dir}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,7 +222,13 @@ def parse_args() -> argparse.Namespace:
 		"--ckpt",
 		type=str,
 		required=True,
-		help="Path to 3DGS checkpoint (.pt)",
+		help="Path to 3DGS background checkpoint (.pt)",
+	)
+	parser.add_argument(
+		"--fg_mesh",
+		type=str,
+		default=None,
+		help="Path to foreground mesh (.ply/.obj) (optional)",
 	)
 	parser.add_argument(
 		"--colmap_dir",
@@ -156,7 +240,7 @@ def parse_args() -> argparse.Namespace:
 		"--output",
 		type=str,
 		required=True,
-		help="Output directory (will create alpha/ and depth/ subfolders)",
+		help="Output directory (imdg/ folder will be created inside with alpha, depth, fgmask subfolders)",
 	)
 	parser.add_argument(
 		"--device",
@@ -196,11 +280,14 @@ def main():
 	device = torch.device(args.device)
 
 	ckpt_path = Path(args.ckpt)
+	fg_mesh_path = Path(args.fg_mesh) if args.fg_mesh else None
 	colmap_dir = Path(args.colmap_dir)
-	output_dir = Path(args.output)
+	output_dir = Path(args.output) / "imdg"
 
 	if not ckpt_path.exists():
 		raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+	if fg_mesh_path and not fg_mesh_path.exists():
+		raise FileNotFoundError(f"Foreground mesh not found: {fg_mesh_path}")
 	if not colmap_dir.exists():
 		raise FileNotFoundError(f"COLMAP path not found: {colmap_dir}")
 
@@ -208,6 +295,7 @@ def main():
 
 	render_all_views(
 		ckpt_path=ckpt_path,
+		fg_mesh_path=fg_mesh_path,
 		colmap_dir=colmap_dir,
 		output_dir=output_dir,
 		device=device,

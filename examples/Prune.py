@@ -12,9 +12,9 @@ usage: python Prune.py
     [--dbscan_max_points 80000]
     [--dbscan_chunk_size 100000]
     [--mesh_recover]
-    [--mesh_method alpha|convex|sdf]
+    [--mesh_method auto|alpha|convex|sdf]
     [--mesh_alpha 0.03]
-    [--mesh_scale 1.02]
+    [--mesh_scale 1.01]
     [--mesh_save_ply]
     [--export_split_surface]
     [--split_surface_out <path_to_ply>]
@@ -294,69 +294,85 @@ def _build_foreground_mesh(
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(fg_xyz.astype(np.float64, copy=False))
 
-    used_method = method
-    if method == "alpha":
-        tetra_mesh, pt_map = o3d.geometry.TetraMesh.create_from_point_cloud(pcd)
-        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
-            pcd, alpha, tetra_mesh, pt_map
-        )
-    elif method == "convex":
-        mesh, _ = pcd.compute_convex_hull()
-    elif method == "sdf":
-        if marching_cubes is None:
-            raise ImportError("Please install scikit-image (pip install scikit-image) to use sdf mesh generation.")
-        
-        # 1. Determine the bounding box and voxel grid range
-        voxel_size = alpha  # Reuse alpha as voxel_size for the sdf method
-        padding = voxel_size * 5
-        min_bound = fg_xyz.min(axis=0) - padding
-        max_bound = fg_xyz.max(axis=0) + padding
-        
-        # 2. Generate 3D coordinate grid
-        x = np.arange(min_bound[0], max_bound[0], voxel_size)
-        y = np.arange(min_bound[1], max_bound[1], voxel_size)
-        z = np.arange(min_bound[2], max_bound[2], voxel_size)
-        xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
-        grid_points = np.c_[xx.ravel(), yy.ravel(), zz.ravel()]
-        
-        # 3. Use KDTree to compute the un-signed distance field
-        # Querying in chunks to avoid out-of-memory errors
-        tree = KDTree(fg_xyz)
-        chunk_size = 1000000
-        distances = np.zeros(grid_points.shape[0], dtype=np.float32)
-        for i in range(0, grid_points.shape[0], chunk_size):
-            dist, _ = tree.query(grid_points[i:i+chunk_size], k=1)
-            distances[i:i+chunk_size] = dist.flatten()
-            
-        distances = distances.reshape((len(x), len(y), len(z)))
-        
-        # 4. Extract isosurface using Marching Cubes
-        # Extracting the boundary at a distance of voxel_size * 1.5
-        verts, faces, normals, values = marching_cubes(distances, level=voxel_size * 1.5)
-        
-        # 5. Convert vertices back to the world coordinates
-        verts[:, 0] = verts[:, 0] * voxel_size + min_bound[0]
-        verts[:, 1] = verts[:, 1] * voxel_size + min_bound[1]
-        verts[:, 2] = verts[:, 2] * voxel_size + min_bound[2]
-        
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(verts)
-        mesh.triangles = o3d.utility.Vector3iVector(faces)
+    if method == "auto":
+        methods_to_try = ["sdf", "alpha", "convex"]
     else:
-        raise ValueError(f"Unknown mesh method: {method}")
+        methods_to_try = [method]
 
-    mesh.remove_duplicated_vertices()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_unreferenced_vertices()
+    used_method = method
+    mesh = None
 
-    if method == "alpha" and (len(mesh.vertices) == 0 or len(mesh.triangles) == 0 or not mesh.is_watertight()):
-        mesh, _ = pcd.compute_convex_hull()
-        mesh.remove_duplicated_vertices()
-        mesh.remove_duplicated_triangles()
-        mesh.remove_degenerate_triangles()
-        mesh.remove_unreferenced_vertices()
-        used_method = "convex(fallback)"
+    for m in methods_to_try:
+        try:
+            if m == "alpha":
+                tetra_mesh, pt_map = o3d.geometry.TetraMesh.create_from_point_cloud(pcd)
+                mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
+                    pcd, alpha, tetra_mesh, pt_map
+                )
+            elif m == "convex":
+                mesh, _ = pcd.compute_convex_hull()
+            elif m == "sdf":
+                if marching_cubes is None:
+                    raise ImportError("Please install scikit-image (pip install scikit-image) to use sdf mesh generation.")
+                
+                # 1. Determine the bounding box and voxel grid range
+                voxel_size = alpha  # Reuse alpha as voxel_size for the sdf method
+                padding = voxel_size * 5
+                min_bound = fg_xyz.min(axis=0) - padding
+                max_bound = fg_xyz.max(axis=0) + padding
+                
+                # 2. Generate 3D coordinate grid
+                x = np.arange(min_bound[0], max_bound[0], voxel_size)
+                y = np.arange(min_bound[1], max_bound[1], voxel_size)
+                z = np.arange(min_bound[2], max_bound[2], voxel_size)
+                xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
+                grid_points = np.c_[xx.ravel(), yy.ravel(), zz.ravel()]
+                
+                # 3. Use KDTree to compute the un-signed distance field
+                # Querying in chunks to avoid out-of-memory errors
+                tree = KDTree(fg_xyz)
+                chunk_size = 1000000
+                distances = np.zeros(grid_points.shape[0], dtype=np.float32)
+                for i in range(0, grid_points.shape[0], chunk_size):
+                    dist, _ = tree.query(grid_points[i:i+chunk_size], k=1)
+                    distances[i:i+chunk_size] = dist.flatten()
+                    
+                distances = distances.reshape((len(x), len(y), len(z)))
+                
+                # 4. Extract isosurface using Marching Cubes
+                # Extracting the boundary at a distance of voxel_size * 1.5
+                verts, faces, normals, values = marching_cubes(distances, level=voxel_size * 1.5)
+                
+                # 5. Convert vertices back to the world coordinates
+                verts[:, 0] = verts[:, 0] * voxel_size + min_bound[0]
+                verts[:, 1] = verts[:, 1] * voxel_size + min_bound[1]
+                verts[:, 2] = verts[:, 2] * voxel_size + min_bound[2]
+                
+                mesh = o3d.geometry.TriangleMesh()
+                mesh.vertices = o3d.utility.Vector3dVector(verts)
+                mesh.triangles = o3d.utility.Vector3iVector(faces)
+            else:
+                raise ValueError(f"Unknown mesh method: {m}")
+
+            mesh.remove_duplicated_vertices()
+            mesh.remove_duplicated_triangles()
+            mesh.remove_degenerate_triangles()
+            mesh.remove_unreferenced_vertices()
+
+            # Check if valid for fallback
+            if method == "auto" and m != "convex":
+                if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+                    raise ValueError(f"Method {m} generated empty mesh.")
+                if not mesh.is_watertight():
+                    raise ValueError(f"Method {m} generated non-watertight mesh.")
+            
+            used_method = m if method != "auto" else f"auto(fallback to {m})"
+            break  # Success
+        except Exception as e:
+            if method == "auto":
+                print(f"Fallback warning: Method '{m}' failed or produced non-watertight mesh ({e}). Trying next...")
+            else:
+                raise e
 
     return mesh, used_method
 
@@ -743,25 +759,25 @@ def main():
     parser.add_argument(
         "--dbscan_eps",
         type=float,
-        default=0.05,
+        default=0.08,
         help="DBSCAN eps in world units. Used only when --dbscan_clean is enabled."
     )
     parser.add_argument(
         "--dbscan_min_samples",
         type=int,
-        default=10,
+        default=20,
         help="DBSCAN min_samples. Used only when --dbscan_clean is enabled."
     )
     parser.add_argument(
         "--dbscan_max_points",
         type=int,
-        default=120000,
+        default=80000,
         help="Max points for DBSCAN fitting. If gaussians exceed this, sampled mode is used."
     )
     parser.add_argument(
         "--dbscan_chunk_size",
         type=int,
-        default=200000,
+        default=100000,
         help="Chunk size for propagating sampled DBSCAN largest cluster to all gaussians."
     )
     parser.add_argument(
@@ -801,9 +817,9 @@ def main():
     parser.add_argument(
         "--mesh_method",
         type=str,
-        choices=["alpha", "convex", "sdf"],
-        default="alpha",
-        help="(Used with --mesh_recover) mesh construction method from foreground points. 'sdf' uses distance field and marching cubes."
+        choices=["auto", "alpha", "convex", "sdf"],
+        default="auto",
+        help="(Used with --mesh_recover) mesh construction method from foreground points. 'auto' uses sdf->alpha->convex fallback."
     )
     parser.add_argument(
         "--mesh_alpha",
@@ -814,7 +830,7 @@ def main():
     parser.add_argument(
         "--mesh_scale",
         type=float,
-        default=1.02,
+        default=0.98,
         help="(Used with --mesh_recover) isotropic scale around mesh center for inflation."
     )
     parser.add_argument(

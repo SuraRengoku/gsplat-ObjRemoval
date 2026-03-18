@@ -67,10 +67,11 @@ def load_splats(ckpt_path: Path, device: torch.device) -> Dict[str, torch.Tensor
 	}
 
 
-def _build_rays(K: np.ndarray, R: np.ndarray, t: np.ndarray, H: int, W: int) -> np.ndarray:
+def _build_rays(K: np.ndarray, R: np.ndarray, t: np.ndarray, H: int, W: int) -> Tuple[np.ndarray, np.ndarray]:
 	"""
 	Build world-space rays [H, W, 6] for image.
 	COLMAP uses x_cam = R @ x_world + t.
+	Returns rays and cos_theta for depth conversion.
 	"""
 	ys, xs = np.meshgrid(
 		np.arange(H, dtype=np.float32),
@@ -83,6 +84,7 @@ def _build_rays(K: np.ndarray, R: np.ndarray, t: np.ndarray, H: int, W: int) -> 
 	Kinv = np.linalg.inv(K).astype(np.float32)
 	dirs_cam = (pix @ Kinv.T).astype(np.float32)
 	dirs_cam /= (np.linalg.norm(dirs_cam, axis=1, keepdims=True) + 1e-9)
+	cos_theta = dirs_cam[:, 2].reshape(H, W)
 
 	Rt = R.T.astype(np.float32)
 	dirs_world = (dirs_cam @ Rt.T).astype(np.float32)
@@ -91,7 +93,8 @@ def _build_rays(K: np.ndarray, R: np.ndarray, t: np.ndarray, H: int, W: int) -> 
 	cam_center = (-Rt @ t.reshape(3, 1)).reshape(1, 3).astype(np.float32)
 	origins_world = np.repeat(cam_center, dirs_world.shape[0], axis=0)
 
-	return np.concatenate([origins_world, dirs_world], axis=1).astype(np.float32)
+	rays = np.concatenate([origins_world, dirs_world], axis=1).astype(np.float32)
+	return rays, cos_theta
 
 @torch.no_grad()
 def render_all_views(
@@ -131,8 +134,10 @@ def render_all_views(
 
 	alpha_dir = output_dir / "alpha"
 	depth_dir = output_dir / "depth"
+	ipmask_dir = output_dir / "ipmask"
 	alpha_dir.mkdir(parents=True, exist_ok=True)
 	depth_dir.mkdir(parents=True, exist_ok=True)
+	ipmask_dir.mkdir(parents=True, exist_ok=True)
 
 	num_gaussians = splats["means"].shape[0]
 	dummy_colors = torch.ones((num_gaussians, 3), dtype=torch.float32, device=device)
@@ -171,15 +176,13 @@ def render_all_views(
 		stem = Path(image_name).stem
 
 		alpha = render_alpha[0, ..., 0].clamp(0.0, 1.0).cpu().numpy()
+		np.save(alpha_dir / f"{stem}.npy", alpha.astype(np.float64))
 		alpha_uint8 = normalize_to_uint8(alpha)
-		plt.imsave(alpha_dir / f"{stem}.png", alpha_uint8)
+		plt.imsave(alpha_dir / f"{stem}.png", alpha_uint8, cmap='gray')
 
 		depth = render_depth[0, ..., 0].cpu().numpy()
 		np.save(depth_dir / f"{stem}.npy", depth.astype(np.float64))
 
-		depth_uint16 = (depth * 1000).astype(np.uint16)
-		imageio.imwrite(depth_dir / f"{stem}_16bit.png", depth_uint16)
-		
 		valid_mask = depth > 0
 		if valid_mask.any():
 			d_min, d_max = depth[valid_mask].min(), depth[valid_mask].max()
@@ -195,23 +198,40 @@ def render_all_views(
 			R = w2c[:3, :3]
 			t = w2c[:3, 3]
 			
-			rays_np = _build_rays(k, R, t, height, width)
-			rays_np = rays_np.reshape(height, width, 6)
+			rays_np, cos_theta = _build_rays(k, R, t, height, width)
+			rays_flat = rays_np.reshape(-1, 6)
 			
-			rays = o3d.core.Tensor(rays_np, dtype=o3d.core.Dtype.Float32)
-			hit = raycaster.cast_rays(rays)
-			t_hit = hit["t_hit"].numpy()
+			rays_t = o3d.core.Tensor(rays_flat, dtype=o3d.core.Dtype.Float32)
+			lx = raycaster.list_intersections(rays_t)
 			
-			fgmask = np.isfinite(t_hit).astype(np.uint8)
+			ray_ids = lx['ray_ids'].numpy()
+			t_hit = lx['t_hit'].numpy()
+			
+			min_t = np.full(height * width, np.inf, dtype=np.float32)
+			max_t = np.full(height * width, -np.inf, dtype=np.float32)
+			
+			if len(ray_ids) > 0:
+				np.minimum.at(min_t, ray_ids, t_hit)
+				np.maximum.at(max_t, ray_ids, t_hit)
+			
+			fgmask = np.isfinite(min_t).astype(np.uint8).reshape(height, width)
 			
 			np.save(fgmask_dir / f"{stem}.npy", fgmask)
 			imageio.imwrite(fgmask_dir / f"{stem}.png", fgmask * 255)
+
+			min_z = (min_t * cos_theta.reshape(-1)).reshape(height, width)
+			max_z = (max_t * cos_theta.reshape(-1)).reshape(height, width)
+
+			ipmask = ((alpha < 0.9) & (fgmask > 0) & (depth >= min_z) & (depth <= max_z)).astype(np.uint8)
+			np.save(ipmask_dir / f"{stem}.npy", ipmask)
+			imageio.imwrite(ipmask_dir / f"{stem}.png", ipmask * 255)
 		
 	print("[Done] Render finished.")
 	print(f"[Done] alpha maps: {alpha_dir}")
 	print(f"[Done] depth maps: {depth_dir}")
 	if raycaster is not None:
 		print(f"[Done] fgmask maps: {fgmask_dir}")
+		print(f"[Done] ipmask maps: {ipmask_dir}")
 
 
 def parse_args() -> argparse.Namespace:

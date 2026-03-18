@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 import tyro
+import imageio.v2 as imageio
 from datasets.colmap import Dataset, Parser
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -43,6 +45,15 @@ class Config:
     bg_ckpt: str = ""
     fg_ckpt: str = ""
 
+    # ---- hole masks ----------------------------------------------------------
+    # Directory that contains per-view hole masks named by image stem, e.g.
+    #   frame_0001.npy / frame_0001.png
+    # Masks can be nested in subdirectories; files are discovered recursively.
+    # If empty, fallback is full-image mask for every view.
+    hole_mask_dir: str = ""
+    # Preferred mask format when both exist for one stem.
+    hole_mask_ext: Literal["auto", "npy", "png"] = "auto"
+
     # ---- new Gaussians -------------------------------------------------------
     # Number of new Gaussians to place inside the hole.
     num_new_gs: int = 10_000
@@ -63,7 +74,7 @@ class Config:
 
     # ---- SDS -----------------------------------------------------------------
     # Hugging-Face model id for the inpainting pipeline.
-    sd_model_id: str = "stabilityai/stable-diffusion-2-inpainting"
+    sd_model_id: str = "runwayml/stable-diffusion-inpainting"
     # Text prompt fed to the inpainting model.
     prompt: str = "fill content in the mask area based on surrounding information"
     negative_prompt: str = "artifacts, blurry, low quality"
@@ -302,6 +313,8 @@ def load_hole_masks(
     parser: Parser,
     train_indices: List[int],
     device: str,
+    mask_dir: str,
+    mask_ext: Literal["auto", "npy", "png"] = "auto",
 ) -> Dict[int, Optional[Tensor]]:
     """
     Load per-view binary hole masks.
@@ -315,9 +328,71 @@ def load_hole_masks(
     Returns:
         Dict mapping image_id → float Tensor [H, W], or None (= full image).
     """
-    print("[MASK] WARNING: load_hole_masks is not implemented — "
-          "returning None (full-image) masks as a placeholder.")
-    return {idx: None for idx in train_indices}
+    if not mask_dir:
+        print("[MASK] hole_mask_dir is empty — using full-image masks.")
+        return {idx: None for idx in train_indices}
+
+    root = Path(mask_dir)
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"[MASK] hole_mask_dir not found: {mask_dir}")
+
+    # Build stem -> file lookup for npy/png recursively.
+    npy_map: Dict[str, Path] = {}
+    png_map: Dict[str, Path] = {}
+    for p in root.rglob("*.npy"):
+        npy_map.setdefault(p.stem, p)
+    for p in root.rglob("*.png"):
+        png_map.setdefault(p.stem, p)
+
+    if not npy_map and not png_map:
+        raise RuntimeError(
+            f"[MASK] No .npy/.png files found under: {mask_dir}"
+        )
+
+    def _pick_file(stem: str) -> Optional[Path]:
+        if mask_ext == "npy":
+            return npy_map.get(stem)
+        if mask_ext == "png":
+            return png_map.get(stem)
+        # auto: prefer npy, then png
+        return npy_map.get(stem) or png_map.get(stem)
+
+    def _load_binary_mask(path: Path) -> np.ndarray:
+        if path.suffix.lower() == ".npy":
+            arr = np.load(path)
+        else:
+            arr = imageio.imread(path)
+
+        if arr.ndim == 3:
+            arr = arr[..., 0]
+        arr = arr.astype(np.float32)
+        if arr.max() > 1.0:
+            arr = arr / 255.0
+        return (arr > 0.5).astype(np.float32)
+
+    hole_masks: Dict[int, Optional[Tensor]] = {}
+    missing = 0
+    loaded = 0
+
+    for parser_idx in train_indices:
+        image_name = parser.image_names[parser_idx]
+        stem = Path(image_name).stem
+        mask_path = _pick_file(stem)
+
+        if mask_path is None:
+            hole_masks[parser_idx] = None
+            missing += 1
+            continue
+
+        mask_np = _load_binary_mask(mask_path)
+        hole_masks[parser_idx] = torch.from_numpy(mask_np).to(device)
+        loaded += 1
+
+    print(
+        f"[MASK] Loaded {loaded} masks from {mask_dir} "
+        f"(missing: {missing}, total train views: {len(train_indices)})."
+    )
+    return hole_masks
 
 
 # ---------------------------------------------------------------------------
@@ -573,9 +648,12 @@ class Runner:
             assert_never(cfg.strategy)
 
         # ---- Hole masks (per view) ------------------------------------------
-        #    TODO: Provide real per-view hole masks once implemented.
         self.hole_masks: Dict[int, Optional[Tensor]] = load_hole_masks(
-            self.parser, self.trainset.indices, device
+            self.parser,
+            self.trainset.indices,
+            device,
+            cfg.hole_mask_dir,
+            cfg.hole_mask_ext,
         )
 
         # ---- SDS module ----------------------------------------------------
@@ -600,9 +678,9 @@ class Runner:
             for k, v in merged.items()
         })
 
-    def _get_mask(self, image_id: int, height: int, width: int) -> Tensor:
+    def _get_mask(self, parser_index: int, height: int, width: int) -> Tensor:
         """Return float mask [1, H, W] (1 = hole).  Falls back to full image."""
-        raw = self.hole_masks.get(image_id, None)
+        raw = self.hole_masks.get(parser_index, None)
         if raw is None:
             return torch.ones(1, height, width, device=self.device)
         mask = raw.float().unsqueeze(0)
@@ -676,7 +754,13 @@ class Runner:
                 data_iter = iter(self.trainset)
                 data      = next(data_iter)
 
-            image_id: int   = data["image_id"].item()
+            image_id_raw = data["image_id"]
+            image_id: int = (
+                int(image_id_raw.item())
+                if hasattr(image_id_raw, "item")
+                else int(image_id_raw)
+            )
+            parser_index: int = int(self.trainset.indices[image_id])
             camtoworlds     = data["camtoworld"].unsqueeze(0).to(device)  # [1,4,4]
             Ks              = data["K"].unsqueeze(0).to(device)           # [1,3,3]
             pixels          = data["image"].unsqueeze(0).to(device)       # [1,H,W,3]
@@ -691,7 +775,7 @@ class Runner:
             # colors: [1, H, W, 3]  ∈ [0, 1],  grad flows through new_splats
 
             # ---- per-view hole mask ----------------------------------------
-            mask_hw = self._get_mask(image_id, height, width)  # [1, H, W]
+            mask_hw = self._get_mask(parser_index, height, width)  # [1, H, W]
 
             # ---- SDS loss using SD-Inpainting prior ------------------------
             #
@@ -824,7 +908,29 @@ def main(cfg: Config) -> None:
     runner.train()
 
 
+def _normalize_cli_underscores(argv: List[str]) -> List[str]:
+    """
+    Convert long-option names from underscore style to hyphen style.
+    Example:
+      --hole_mask_dir=... -> --hole-mask-dir=...
+      --hole_mask_dir ... -> --hole-mask-dir ...
+    Values are left untouched.
+    """
+    normalized: List[str] = []
+    for arg in argv:
+        if not arg.startswith("--"):
+            normalized.append(arg)
+            continue
+
+        if "=" in arg:
+            key, value = arg.split("=", 1)
+            normalized.append(key.replace("_", "-") + "=" + value)
+        else:
+            normalized.append(arg.replace("_", "-"))
+    return normalized
+
+
 if __name__ == "__main__":
-    cfg = tyro.cli(Config)
+    cfg = tyro.cli(Config, args=_normalize_cli_underscores(sys.argv[1:]))
     main(cfg)
 

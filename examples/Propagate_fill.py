@@ -1,5 +1,6 @@
 # type: ignore
 import json
+import inspect
 import math
 import os
 import sys
@@ -642,6 +643,12 @@ class Runner:
             self.strategy_state = cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
+            self._default_strategy_pre_has_packed = (
+                "packed" in inspect.signature(cfg.strategy.step_pre_backward).parameters
+            )
+            self._default_strategy_post_has_packed = (
+                "packed" in inspect.signature(cfg.strategy.step_post_backward).parameters
+            )
         elif isinstance(cfg.strategy, MCMCStrategy):
             self.strategy_state = cfg.strategy.initialize_state()
         else:
@@ -701,7 +708,7 @@ class Runner:
         """Render the combined (bg + new) Gaussians.  Returns [B, H, W, 3]."""
         merged = merge_splats_for_render(self.bg_splats, self.new_splats)
 
-        renders, _, _ = rasterization(
+        renders, _, rast_info = rasterization(
             means=merged["means"],
             quats=merged["quats"] / merged["quats"].norm(dim=-1, keepdim=True),
             scales=torch.exp(merged["scales"]),
@@ -716,7 +723,7 @@ class Runner:
             far_plane=self.cfg.far_plane,
             packed=self.cfg.packed,
         )
-        return renders[..., :3]  # [B, H, W, 3]
+        return renders[..., :3], rast_info  # renders [B, H, W, 3] 
         
     def train(self) -> None:
         """
@@ -728,7 +735,7 @@ class Runner:
 		   Initialize new Gaussians by setting the original foreground Gaussians' opacity close to 0
         3. For each training step:
             a. Render RGB images from COLMAP camera poses.
-            b. Retrieve per-view hole masks                [TODO: implement].
+            b. Retrieve per-view hole masks                
             c. Encode rendered image to latent space, add noise.
             d. Run SD Inpainting UNet (no-grad) to get noise prediction.
             e. Compute SDS loss / gradient, apply hole mask.
@@ -771,7 +778,7 @@ class Runner:
 
             # ---- render all Gaussians (bg frozen + new trainable) ----------
             sh_degree = sh_degree_fn(step)
-            colors    = self.rasterize(camtoworlds, Ks, width, height, sh_degree)
+            colors, rast_info = self.rasterize(camtoworlds, Ks, width, height, sh_degree)
             # colors: [1, H, W, 3]  ∈ [0, 1],  grad flows through new_splats
 
             # ---- per-view hole mask ----------------------------------------
@@ -812,6 +819,23 @@ class Runner:
                 torch.exp(self.new_splats["scales"]).norm(dim=-1).mean()
             )
 
+            strategy_info = None
+            if isinstance(cfg.strategy, DefaultStrategy):
+                strategy_info = dict(rast_info)
+                strategy_info["width"] = width
+                strategy_info["height"] = height
+                strategy_info["n_cameras"] = 1
+                pre_kwargs = dict(
+                    params=self.combined_splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=strategy_info,
+                )
+                if self._default_strategy_pre_has_packed:
+                    pre_kwargs["packed"] = cfg.packed
+                cfg.strategy.step_pre_backward(**pre_kwargs)
+
             total_loss = sds_loss + reg_loss
             total_loss.backward()
 
@@ -823,19 +847,17 @@ class Runner:
             self._rebuild_combined_splats()
 
             if isinstance(cfg.strategy, DefaultStrategy):
-                cfg.strategy.step_post_backward(
+                assert strategy_info is not None
+                post_kwargs = dict(
                     params=self.combined_splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
-                    info={
-                        "means2d": None,   # grad-based split disabled (no 2-D means here)
-                        "width":   width,
-                        "height":  height,
-                        "n_cameras": 1,
-                    },
-                    packed=cfg.packed,
+                    info=strategy_info,
                 )
+                if self._default_strategy_post_has_packed:
+                    post_kwargs["packed"] = cfg.packed
+                cfg.strategy.step_post_backward(**post_kwargs)
             elif isinstance(cfg.strategy, MCMCStrategy):
                 cfg.strategy.step_post_backward(
                     params=self.combined_splats,

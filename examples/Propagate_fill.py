@@ -621,6 +621,7 @@ class Runner:
         # 1. Background (frozen).
         assert cfg.bg_ckpt, "bg_ckpt must point to the background .pt checkpoint!"
         self.bg_splats = load_bg_splats(cfg.bg_ckpt, device)
+        self.bg_count = self.bg_splats["means"].shape[0]
 
         # 2. New Gaussians (trainable).
         #    TODO: Replace random init with hole-aware placement.
@@ -708,7 +709,7 @@ class Runner:
 
     def _extract_new_strategy_info(self, rast_info: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """Extract rasterization info for new Gaussians only."""
-        bg_count = self.bg_splats["means"].shape[0]
+        bg_count = self.bg_count
 
         info: Dict[str, Tensor] = {}
 
@@ -730,6 +731,31 @@ class Runner:
             )
 
         return info
+
+    def _inject_new_gradient_for_strategy(
+        self,
+        strategy_info: Dict[str, Tensor],
+        rast_info: Dict[str, Tensor],
+    ) -> None:
+        """Attach new-only 2D gradient tensor to strategy_info[key].grad."""
+        bg_count = self.bg_count
+        key_for_gradient = "means2d"
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            key_for_gradient = self.cfg.strategy.key_for_gradient
+
+        full_grad = rast_info[key_for_gradient].grad
+        assert full_grad is not None, f"Missing grad for {key_for_gradient}."
+
+        if self.cfg.packed:
+            gaussian_ids = rast_info["gaussian_ids"]
+            keep = gaussian_ids >= bg_count
+            grad_new = full_grad[keep]
+        else:
+            grad_new = full_grad[:, bg_count:]
+
+        grad_holder = torch.zeros_like(strategy_info[key_for_gradient], requires_grad=True)
+        grad_holder.grad = grad_new
+        strategy_info[key_for_gradient] = grad_holder
 
     def rasterize(
         self,
@@ -859,12 +885,15 @@ class Runner:
                 strategy_info["width"] = width
                 strategy_info["height"] = height
                 strategy_info["n_cameras"] = 1
+
+                # For pre-backward, retain grad on the original rasterization tensor.
+                pre_info = {cfg.strategy.key_for_gradient: rast_info[cfg.strategy.key_for_gradient]}
                 pre_kwargs = dict(
                     params=self.new_splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
-                    info=strategy_info,
+                    info=pre_info,
                 )
                 if self._default_strategy_pre_has_packed:
                     pre_kwargs["packed"] = cfg.packed
@@ -879,6 +908,7 @@ class Runner:
 
             if cfg.enable_strategy and isinstance(cfg.strategy, DefaultStrategy):
                 assert strategy_info is not None
+                self._inject_new_gradient_for_strategy(strategy_info, rast_info)
                 post_kwargs = dict(
                     params=self.new_splats,
                     optimizers=self.optimizers,

@@ -106,6 +106,11 @@ class Config:
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
+    # IMPORTANT: In this script we optimize only `new_splats` while rendering
+    # with `bg + new`. Densification strategies expect params/optimizers to be
+    # aligned and can become inconsistent in this mixed setup. Keep disabled
+    # by default for stability.
+    enable_strategy: bool = False
 
     # ---- regularization ------------------------------------------------------
     # L2 penalty on scales of new Gaussians to keep them compact.
@@ -638,21 +643,25 @@ class Runner:
 
         # ---- Densification strategy -----------------------------------------
         self._rebuild_combined_splats()
-        cfg.strategy.check_sanity(self.combined_splats, self.optimizers)
-        if isinstance(cfg.strategy, DefaultStrategy):
-            self.strategy_state = cfg.strategy.initialize_state(
-                scene_scale=self.scene_scale
-            )
-            self._default_strategy_pre_has_packed = (
-                "packed" in inspect.signature(cfg.strategy.step_pre_backward).parameters
-            )
-            self._default_strategy_post_has_packed = (
-                "packed" in inspect.signature(cfg.strategy.step_post_backward).parameters
-            )
-        elif isinstance(cfg.strategy, MCMCStrategy):
-            self.strategy_state = cfg.strategy.initialize_state()
-        else:
-            assert_never(cfg.strategy)
+        self.strategy_state = None
+        self._default_strategy_pre_has_packed = False
+        self._default_strategy_post_has_packed = False
+        if cfg.enable_strategy:
+            cfg.strategy.check_sanity(self.new_splats, self.optimizers)
+            if isinstance(cfg.strategy, DefaultStrategy):
+                self.strategy_state = cfg.strategy.initialize_state(
+                    scene_scale=self.scene_scale
+                )
+                self._default_strategy_pre_has_packed = (
+                    "packed" in inspect.signature(cfg.strategy.step_pre_backward).parameters
+                )
+                self._default_strategy_post_has_packed = (
+                    "packed" in inspect.signature(cfg.strategy.step_post_backward).parameters
+                )
+            elif isinstance(cfg.strategy, MCMCStrategy):
+                self.strategy_state = cfg.strategy.initialize_state()
+            else:
+                assert_never(cfg.strategy)
 
         # ---- Hole masks (per view) ------------------------------------------
         self.hole_masks: Dict[int, Optional[Tensor]] = load_hole_masks(
@@ -696,6 +705,31 @@ class Runner:
                 mask.unsqueeze(0), size=(height, width), mode="nearest"
             ).squeeze(0)
         return mask.to(self.device)
+
+    def _extract_new_strategy_info(self, rast_info: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """Extract rasterization info for new Gaussians only."""
+        bg_count = self.bg_splats["means"].shape[0]
+
+        info: Dict[str, Tensor] = {}
+
+        key_for_gradient = "means2d"
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            key_for_gradient = self.cfg.strategy.key_for_gradient
+
+        if self.cfg.packed:
+            gaussian_ids = rast_info["gaussian_ids"]
+            keep = gaussian_ids >= bg_count
+            info["gaussian_ids"] = gaussian_ids[keep] - bg_count
+            info["radii"] = rast_info["radii"][keep]
+            info[key_for_gradient] = rast_info[key_for_gradient][keep]
+        else:
+            info["radii"] = rast_info["radii"][:, bg_count:]
+            info[key_for_gradient] = rast_info[key_for_gradient][:, bg_count:]
+            info["gaussian_ids"] = torch.empty(
+                0, dtype=torch.long, device=info["radii"].device
+            )
+
+        return info
 
     def rasterize(
         self,
@@ -820,13 +854,13 @@ class Runner:
             )
 
             strategy_info = None
-            if isinstance(cfg.strategy, DefaultStrategy):
-                strategy_info = dict(rast_info)
+            if cfg.enable_strategy and isinstance(cfg.strategy, DefaultStrategy):
+                strategy_info = self._extract_new_strategy_info(rast_info)
                 strategy_info["width"] = width
                 strategy_info["height"] = height
                 strategy_info["n_cameras"] = 1
                 pre_kwargs = dict(
-                    params=self.combined_splats,
+                    params=self.new_splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
@@ -843,13 +877,10 @@ class Runner:
             for opt in self.optimizers.values():
                 opt.step()
 
-            # ---- densification (optional) ----------------------------------
-            self._rebuild_combined_splats()
-
-            if isinstance(cfg.strategy, DefaultStrategy):
+            if cfg.enable_strategy and isinstance(cfg.strategy, DefaultStrategy):
                 assert strategy_info is not None
                 post_kwargs = dict(
-                    params=self.combined_splats,
+                    params=self.new_splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
@@ -858,15 +889,18 @@ class Runner:
                 if self._default_strategy_post_has_packed:
                     post_kwargs["packed"] = cfg.packed
                 cfg.strategy.step_post_backward(**post_kwargs)
-            elif isinstance(cfg.strategy, MCMCStrategy):
+            elif cfg.enable_strategy and isinstance(cfg.strategy, MCMCStrategy):
                 cfg.strategy.step_post_backward(
-                    params=self.combined_splats,
+                    params=self.new_splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
                     step=step,
                     info={},
                     lr=cfg.means_lr * self.scene_scale,
                 )
+
+            # ---- refresh merged state for ckpt/export ----------------------
+            self._rebuild_combined_splats()
 
             # ---- logging ---------------------------------------------------
             pbar.set_postfix(

@@ -647,6 +647,10 @@ class Runner:
         self.strategy_state = None
         self._default_strategy_pre_has_packed = False
         self._default_strategy_post_has_packed = False
+        self._strategy_cap_warned = False
+        # Internal hard cap to avoid densification explosion and OOM.
+        # Intentionally not exposed as CLI arg.
+        self._max_new_gs_cap = 800_000
         if cfg.enable_strategy:
             cfg.strategy.check_sanity(self.new_splats, self.optimizers)
             if isinstance(cfg.strategy, DefaultStrategy):
@@ -706,6 +710,51 @@ class Runner:
                 mask.unsqueeze(0), size=(height, width), mode="nearest"
             ).squeeze(0)
         return mask.to(self.device)
+
+    def _rebuild_new_splats_from_keep_mask(self, keep_mask: Tensor) -> None:
+        """Keep a subset of new splats and rebuild optimizers/strategy state."""
+        keep_mask = keep_mask.bool()
+        assert keep_mask.ndim == 1 and keep_mask.shape[0] == len(self.new_splats["means"])
+
+        self.new_splats = torch.nn.ParameterDict({
+            k: torch.nn.Parameter(v[keep_mask].detach().clone(), requires_grad=True)
+            for k, v in self.new_splats.items()
+        }).to(self.device)
+
+        self.optimizers = create_new_splat_optimizers(
+            self.new_splats, self.cfg, self.scene_scale
+        )
+
+        if self.cfg.enable_strategy:
+            if isinstance(self.cfg.strategy, DefaultStrategy):
+                self.strategy_state = self.cfg.strategy.initialize_state(
+                    scene_scale=self.scene_scale
+                )
+            elif isinstance(self.cfg.strategy, MCMCStrategy):
+                self.strategy_state = self.cfg.strategy.initialize_state()
+
+    def _enforce_new_gs_cap_if_needed(self) -> None:
+        """Prune low-opacity new GSs to satisfy max_new_gs cap."""
+        cap = self._max_new_gs_cap
+        if cap <= 0:
+            return
+
+        n_new = len(self.new_splats["means"])
+        if n_new <= cap:
+            return
+
+        with torch.no_grad():
+            keep_count = int(cap)
+            scores = torch.sigmoid(self.new_splats["opacities"]).detach()
+            topk = torch.topk(scores, k=keep_count, largest=True, sorted=False).indices
+            keep_mask = torch.zeros_like(scores, dtype=torch.bool)
+            keep_mask[topk] = True
+
+        print(
+            f"[CAP] Pruning new GSs from {n_new} -> {keep_count} "
+            f"(keeping highest opacity)."
+        )
+        self._rebuild_new_splats_from_keep_mask(keep_mask)
 
     def _extract_new_strategy_info(self, rast_info: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """Extract rasterization info for new Gaussians only."""
@@ -880,7 +929,23 @@ class Runner:
             )
 
             strategy_info = None
-            if cfg.enable_strategy and isinstance(cfg.strategy, DefaultStrategy):
+            n_new_gs = len(self.new_splats["means"])
+            strategy_allowed = (
+                cfg.enable_strategy
+                and (self._max_new_gs_cap <= 0 or n_new_gs < self._max_new_gs_cap)
+            )
+            if (
+                cfg.enable_strategy
+                and not strategy_allowed
+                and not self._strategy_cap_warned
+            ):
+                print(
+                    f"[STRATEGY] max_new_gs={self._max_new_gs_cap} reached "
+                    f"(current={n_new_gs}). Densification disabled for remaining steps."
+                )
+                self._strategy_cap_warned = True
+
+            if strategy_allowed and isinstance(cfg.strategy, DefaultStrategy):
                 strategy_info = self._extract_new_strategy_info(rast_info)
                 strategy_info["width"] = width
                 strategy_info["height"] = height
@@ -906,7 +971,7 @@ class Runner:
             for opt in self.optimizers.values():
                 opt.step()
 
-            if cfg.enable_strategy and isinstance(cfg.strategy, DefaultStrategy):
+            if strategy_allowed and isinstance(cfg.strategy, DefaultStrategy):
                 assert strategy_info is not None
                 self._inject_new_gradient_for_strategy(strategy_info, rast_info)
                 post_kwargs = dict(
@@ -919,7 +984,7 @@ class Runner:
                 if self._default_strategy_post_has_packed:
                     post_kwargs["packed"] = cfg.packed
                 cfg.strategy.step_post_backward(**post_kwargs)
-            elif cfg.enable_strategy and isinstance(cfg.strategy, MCMCStrategy):
+            elif strategy_allowed and isinstance(cfg.strategy, MCMCStrategy):
                 cfg.strategy.step_post_backward(
                     params=self.new_splats,
                     optimizers=self.optimizers,
@@ -928,6 +993,9 @@ class Runner:
                     info={},
                     lr=cfg.means_lr * self.scene_scale,
                 )
+
+            # Hard anti-explosion guard for memory stability.
+            self._enforce_new_gs_cap_if_needed()
 
             # ---- refresh merged state for ckpt/export ----------------------
             self._rebuild_combined_splats()
@@ -947,6 +1015,15 @@ class Runner:
                     canvas = colors[0].detach().cpu().numpy()
                     self.writer.add_image("train/render", canvas.transpose(2, 0, 1), step)
                 self.writer.flush()
+
+            # ---- periodic render dump -------------------------------------
+            if step % 50 == 0:
+                render_np = colors[0].detach().clamp(0.0, 1.0).cpu().numpy()
+                render_u8 = (render_np * 255.0).astype(np.uint8)
+                imageio.imwrite(
+                    os.path.join(self.render_dir, f"render_{step:05d}_img{parser_index:04d}.png"),
+                    render_u8,
+                )
 
             # ---- checkpoint ------------------------------------------------
             if step + 1 in cfg.save_steps or step == max_steps - 1:

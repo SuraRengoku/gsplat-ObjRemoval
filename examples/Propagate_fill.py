@@ -217,6 +217,7 @@ def create_new_splats_with_fg(ckpt_path: str, device: str) -> torch.nn.Parameter
     Using ε = 0.005  →  logit ≈ -5.3.
     """
     NEAR_ZERO_OPACITY = 0.005  # sigmoid(-5.3) ≈ 0.005
+    SCALE_LOG_OFFSET = 0.8     # shrink initial scale in log-space
     EXCLUDE = {"foreground_logits"}
 
     print(f"[FG] Loading foreground checkpoint: {ckpt_path}")
@@ -230,7 +231,8 @@ def create_new_splats_with_fg(ckpt_path: str, device: str) -> torch.nn.Parameter
         if isinstance(v, torch.Tensor) and k not in EXCLUDE
     }).to(device)
 
-    # Override opacities with near-zero values (in logit / pre-sigmoid space).
+    # Keep geometry positions from FG init, but make appearance conservative.
+    # 1) Near-zero opacity (in logit / pre-sigmoid space).
     num_gs = splats["means"].shape[0]
     init_logit = math.log(NEAR_ZERO_OPACITY / (1.0 - NEAR_ZERO_OPACITY))
     splats["opacities"] = torch.nn.Parameter(
@@ -238,9 +240,31 @@ def create_new_splats_with_fg(ckpt_path: str, device: str) -> torch.nn.Parameter
         requires_grad=True,
     )
 
+    # 2) Appearance reset: do not inherit removed-object colors.
+    #    Use neutral gray DC term and zero higher-order SH.
+    neutral_rgb = torch.full((num_gs, 3), 0.5, device=device)
+    splats["sh0"] = torch.nn.Parameter(
+        rgb_to_sh(neutral_rgb).unsqueeze(1),
+        requires_grad=True,
+    )
+    splats["shN"] = torch.nn.Parameter(
+        torch.zeros_like(splats["shN"]),
+        requires_grad=True,
+    )
+
+    # 3) Conservative geometric init: keep rotations, slightly shrink scales.
+    splats["quats"] = torch.nn.Parameter(
+        F.normalize(splats["quats"].detach(), dim=-1),
+        requires_grad=True,
+    )
+    splats["scales"] = torch.nn.Parameter(
+        (splats["scales"].detach() - SCALE_LOG_OFFSET).clamp(min=-10.0, max=2.0),
+        requires_grad=True,
+    )
+
     print(
         f"[FG] Loaded {num_gs} foreground Gaussians as trainable new splats "
-        f"(opacity reset to {NEAR_ZERO_OPACITY})."
+        f"(opacity reset, appearance reset, conservative scales)."
     )
     return splats
 

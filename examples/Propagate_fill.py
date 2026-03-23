@@ -115,6 +115,15 @@ class Config:
     # ---- regularization ------------------------------------------------------
     # L2 penalty on scales of new Gaussians to keep them compact.
     scale_reg: float = 1e-3
+    # L1 penalty on opacity to discourage early opaque blobs.
+    opacity_reg: float = 1e-3
+
+    # ---- optimization stabilizers -------------------------------------------
+    # Warmup steps: freeze geometry (means/scales/quats), optimize only
+    # appearance + opacity so SDS first learns texture/color before moving points.
+    geom_warmup_steps: int = 1200
+    # Cap opacity during warmup to avoid early dark/opaque collapse.
+    warmup_opacity_cap: float = 0.15
 
     # ---- misc ----------------------------------------------------------------
     save_steps: List[int] = field(default_factory=lambda: [2_500, 5_000])
@@ -166,21 +175,112 @@ def create_new_splats(
     sh_degree: int,
     init_opacity: float,
     init_scale: float,
+    parser: Parser,
+    train_indices: List[int],
+    hole_masks: Dict[int, Optional[Tensor]],
     device: str,
 ) -> torch.nn.ParameterDict:
     """
-    Initialise *new* Gaussians that will be optimised to fill the hole.
+    Initialise *new* Gaussians from a coarse visual hull built by hole masks.
 
-    TODO: Replace the random initialisation below with a placement strategy
-          that samples points from *inside* the hole region, e.g.:
-            - Back-project hole pixels from multiple views into 3-D.
-            - Use a visual-hull / voxel intersection of hole masks.
-            - Sample along camera rays that pass through the hole.
+    We sample candidate 3D points in normalized scene bounds and keep points
+    that project into hole masks across multiple training views.
     """
-    print(f"[NEW] Initialising {num} new Gaussians (random placeholder).")
+    print(f"[NEW] Initialising {num} new Gaussians from hole-mask visual hull.")
 
-    # Placeholder: uniform random positions within [-scene_scale, scene_scale]^3.
-    means = (torch.rand(num, 3, device=device) * 2 - 1) * scene_scale
+    def _random_means() -> torch.Tensor:
+        return (torch.rand(num, 3, device=device) * 2 - 1) * scene_scale
+
+    # Collect valid views with masks.
+    view_data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for parser_idx in train_indices:
+        raw_mask = hole_masks.get(parser_idx, None)
+        if raw_mask is None:
+            continue
+
+        mask = raw_mask.detach().cpu()
+        if mask.ndim == 3:
+            mask = mask.squeeze(0)
+        mask = (mask > 0.5)
+        if mask.sum().item() == 0:
+            continue
+
+        cam_id = parser.camera_ids[parser_idx]
+        K = torch.from_numpy(parser.Ks_dict[cam_id].astype(np.float32))
+        camtoworld = torch.from_numpy(parser.camtoworlds[parser_idx].astype(np.float32))
+        worldtocam = torch.linalg.inv(camtoworld)[:3, :]
+        view_data.append((K, worldtocam, mask))
+
+    if len(view_data) == 0:
+        print("[NEW] WARNING: No valid hole masks found; falling back to random init.")
+        means = _random_means()
+    else:
+        min_support = max(2, min(len(view_data), int(0.3 * len(view_data))))
+        ratio_threshold = 0.55
+        sample_batch = max(50_000, min(300_000, num * 8))
+        max_rounds = 40
+
+        accepted: List[torch.Tensor] = []
+        accepted_count = 0
+
+        for _ in range(max_rounds):
+            pts = (torch.rand(sample_batch, 3) * 2 - 1) * scene_scale  # CPU candidates
+            visible_count = torch.zeros(sample_batch, dtype=torch.int32)
+            hit_count = torch.zeros(sample_batch, dtype=torch.int32)
+
+            for K, worldtocam, mask in view_data:
+                cam = pts @ worldtocam[:, :3].T + worldtocam[:, 3]
+                z = cam[:, 2]
+                valid_z = z > 1e-6
+
+                x = cam[:, 0] / torch.clamp_min(z, 1e-6)
+                y = cam[:, 1] / torch.clamp_min(z, 1e-6)
+                u = K[0, 0] * x + K[0, 2]
+                v = K[1, 1] * y + K[1, 2]
+
+                h, w = int(mask.shape[0]), int(mask.shape[1])
+                inside = (
+                    valid_z
+                    & (u >= 0) & (u < w)
+                    & (v >= 0) & (v < h)
+                )
+                if inside.any():
+                    visible_count[inside] += 1
+                    ui = u[inside].long()
+                    vi = v[inside].long()
+                    hit = mask[vi, ui]
+                    hit_count[inside] += hit.to(torch.int32)
+
+            visible_ok = visible_count >= min_support
+            ratio = hit_count.float() / torch.clamp_min(visible_count.float(), 1.0)
+            keep = visible_ok & (hit_count >= min_support) & (ratio >= ratio_threshold)
+
+            if keep.any():
+                keep_pts = pts[keep]
+                accepted.append(keep_pts)
+                accepted_count += int(keep_pts.shape[0])
+
+            if accepted_count >= num:
+                break
+
+        if accepted_count == 0:
+            print("[NEW] WARNING: Visual hull produced 0 points; falling back to random init.")
+            means = _random_means()
+        else:
+            cat = torch.cat(accepted, dim=0)
+            if cat.shape[0] >= num:
+                perm = torch.randperm(cat.shape[0])[:num]
+                means = cat[perm].to(device)
+            else:
+                repeats = math.ceil(num / cat.shape[0])
+                cat = cat.repeat(repeats, 1)[:num]
+                jitter = torch.randn_like(cat) * (0.01 * scene_scale)
+                means = (cat + jitter).to(device)
+
+            print(
+                f"[NEW] Visual hull accepted {accepted_count} candidates; "
+                f"using {means.shape[0]} points."
+            )
 
     dist = init_scale * scene_scale
     scales    = torch.full((num, 3), math.log(dist), device=device)
@@ -189,8 +289,9 @@ def create_new_splats(
         (num,), math.log(init_opacity / (1.0 - init_opacity)), device=device
     )
 
-    # SH colours: dc band = 0 (grey), higher bands = 0.
-    sh0 = torch.zeros(num, 1, 3, device=device)
+    # SH colours: neutral gray DC band, higher bands = 0.
+    neutral_rgb = torch.full((num, 3), 0.5, device=device)
+    sh0 = rgb_to_sh(neutral_rgb).unsqueeze(1)
     shN = torch.zeros(num, (sh_degree + 1) ** 2 - 1, 3, device=device)
 
     splats = torch.nn.ParameterDict({
@@ -641,6 +742,15 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print(f"Scene scale: {self.scene_scale:.4f}")
 
+        # ---- Hole masks (per view) ------------------------------------------
+        self.hole_masks: Dict[int, Optional[Tensor]] = load_hole_masks(
+            self.parser,
+            self.trainset.indices,
+            device,
+            cfg.hole_mask_dir,
+            cfg.hole_mask_ext,
+        )
+
         # ---- Gaussians -------------------------------------------------------
         # 1. Background (frozen).
         assert cfg.bg_ckpt, "bg_ckpt must point to the background .pt checkpoint!"
@@ -648,18 +758,25 @@ class Runner:
         self.bg_count = self.bg_splats["means"].shape[0]
 
         # 2. New Gaussians (trainable).
-        #    TODO: Replace random init with hole-aware placement.
-        # self.new_splats = create_new_splats(
-        #     num=cfg.num_new_gs,
-        #     scene_scale=self.scene_scale,
-        #     sh_degree=cfg.sh_degree,
-        #     init_opacity=cfg.init_opacity,
-        #     init_scale=cfg.init_scale,
-        #     device=device,
-        # )
-        
-		# 2. Reuse the foreground Gaussians as the seed 
-        self.new_splats = create_new_splats_with_fg(cfg.fg_ckpt, device)
+        if cfg.hole_mask_dir:
+            self.new_splats = create_new_splats(
+                num=cfg.num_new_gs,
+                scene_scale=self.scene_scale,
+                sh_degree=cfg.sh_degree,
+                init_opacity=cfg.init_opacity,
+                init_scale=cfg.init_scale,
+                parser=self.parser,
+                train_indices=self.trainset.indices.tolist(),
+                hole_masks=self.hole_masks,
+                device=device,
+            )
+        elif cfg.fg_ckpt:
+            print("[NEW] hole_mask_dir not set. Falling back to FG-based init.")
+            self.new_splats = create_new_splats_with_fg(cfg.fg_ckpt, device)
+        else:
+            raise ValueError(
+                "Need hole_mask_dir for visual-hull init, or fg_ckpt for FG fallback init."
+            )
 
         # 3. Optimizers — only for the new Gaussians.
         self.optimizers = create_new_splat_optimizers(
@@ -691,15 +808,6 @@ class Runner:
                 self.strategy_state = cfg.strategy.initialize_state()
             else:
                 assert_never(cfg.strategy)
-
-        # ---- Hole masks (per view) ------------------------------------------
-        self.hole_masks: Dict[int, Optional[Tensor]] = load_hole_masks(
-            self.parser,
-            self.trainset.indices,
-            device,
-            cfg.hole_mask_dir,
-            cfg.hole_mask_ext,
-        )
 
         # ---- SDS module ----------------------------------------------------
         self.sds = SDSInpaintOptimizer(
@@ -952,6 +1060,10 @@ class Runner:
                 torch.exp(self.new_splats["scales"]).norm(dim=-1).mean()
             )
 
+            # Encourage sparse/translucent new splats, especially early on.
+            opacity_vals = torch.sigmoid(self.new_splats["opacities"])
+            opacity_loss = cfg.opacity_reg * opacity_vals.mean()
+
             strategy_info = None
             n_new_gs = len(self.new_splats["means"])
             strategy_allowed = (
@@ -988,12 +1100,26 @@ class Runner:
                     pre_kwargs["packed"] = cfg.packed
                 cfg.strategy.step_pre_backward(**pre_kwargs)
 
-            total_loss = sds_loss + reg_loss
+            total_loss = sds_loss + reg_loss + opacity_loss
             total_loss.backward()
+
+            # Geometry warmup: do not move/split shape too early under noisy SDS.
+            if step < cfg.geom_warmup_steps:
+                for key in ("means", "scales", "quats"):
+                    grad = self.new_splats[key].grad
+                    if grad is not None:
+                        grad.zero_()
 
             # ---- optimizer step (new Gaussians only) -----------------------
             for opt in self.optimizers.values():
                 opt.step()
+
+            # Keep opacity bounded during warmup to avoid black blob collapse.
+            if step < cfg.geom_warmup_steps:
+                cap = min(max(cfg.warmup_opacity_cap, 1e-4), 0.999)
+                cap_logit = math.log(cap / (1.0 - cap))
+                with torch.no_grad():
+                    self.new_splats["opacities"].clamp_(max=cap_logit)
 
             if strategy_allowed and isinstance(cfg.strategy, DefaultStrategy):
                 assert strategy_info is not None
@@ -1028,12 +1154,14 @@ class Runner:
             pbar.set_postfix(
                 sds=f"{sds_loss.item():.4f}",
                 reg=f"{reg_loss.item():.4f}",
+                opa=f"{opacity_loss.item():.4f}",
                 ngs=len(self.new_splats["means"]),
             )
 
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 self.writer.add_scalar("train/sds_loss",   sds_loss.item(),   step)
                 self.writer.add_scalar("train/reg_loss",   reg_loss.item(),   step)
+                self.writer.add_scalar("train/opacity_loss", opacity_loss.item(), step)
                 self.writer.add_scalar("train/num_new_gs", len(self.new_splats["means"]), step)
                 if cfg.tb_save_image:
                     canvas = colors[0].detach().cpu().numpy()

@@ -178,6 +178,7 @@ def create_new_splats(
     parser: Parser,
     train_indices: List[int],
     hole_masks: Dict[int, Optional[Tensor]],
+    ply_dir: Optional[str],
     device: str,
 ) -> torch.nn.ParameterDict:
     """
@@ -210,6 +211,20 @@ def create_new_splats(
         camtoworld = torch.from_numpy(parser.camtoworlds[parser_idx].astype(np.float32))
         worldtocam = torch.linalg.inv(camtoworld)[:3, :]
         view_data.append((K, worldtocam, mask))
+
+    def _save_points_ply(points: torch.Tensor, out_path: Path) -> None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pts = points.detach().cpu().numpy().astype(np.float32)
+        with open(out_path, "w") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {pts.shape[0]}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("end_header\n")
+            for p in pts:
+                f.write(f"{p[0]} {p[1]} {p[2]}\n")
 
     if len(view_data) == 0:
         print("[NEW] WARNING: No valid hole masks found; falling back to random init.")
@@ -281,6 +296,16 @@ def create_new_splats(
                 f"[NEW] Visual hull accepted {accepted_count} candidates; "
                 f"using {means.shape[0]} points."
             )
+
+            if ply_dir:
+                ply_root = Path(ply_dir)
+                _save_points_ply(cat, ply_root / "visual_hull_candidates.ply")
+                _save_points_ply(means.detach().cpu(), ply_root / "visual_hull_init_means.ply")
+                print(
+                    f"[NEW] Saved visual hull points to "
+                    f"{ply_root / 'visual_hull_candidates.ply'} and "
+                    f"{ply_root / 'visual_hull_init_means.ply'}"
+                )
 
     dist = init_scale * scene_scale
     scales    = torch.full((num, 3), math.log(dist), device=device)
@@ -768,6 +793,7 @@ class Runner:
                 parser=self.parser,
                 train_indices=self.trainset.indices.tolist(),
                 hole_masks=self.hole_masks,
+                ply_dir=self.ply_dir,
                 device=device,
             )
         elif cfg.fg_ckpt:

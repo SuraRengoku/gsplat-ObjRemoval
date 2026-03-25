@@ -80,8 +80,8 @@ class Config:
     prompt: str = "fill content in the mask area based on surrounding information"
     negative_prompt: str = "artifacts, blurry, low quality"
     # Timestep sampling range expressed as a *fraction* of the scheduler's
-    # total timesteps (T_max).  DreamFusion uses [0.02, 0.98]; the supervisor
-    # found [0.2, 0.6] produces sharper results by avoiding very high-noise
+    # total timesteps (T_max).  DreamFusion uses [0.02, 0.98]
+    # the supervisor found [0.2, 0.6] produces sharper results by avoiding very high-noise
     # steps that contribute only blurry gradients.
     t_min: float = 0.2
     t_max: float = 0.6

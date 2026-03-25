@@ -20,7 +20,7 @@ class Config:
     # Where to save the 2D repainted images
     result_dir: str = "results/kitchen_2D_inpaints"
     # Prompt for Stable Diffusion
-    prompt: str = "fill content in the mask area based on surrounding information"
+    prompt: str = "background behind the object, perfectly matching the surrounding environment"
     negative_prompt: str = "artifacts, blurry, low quality"
     # Checkpoint
     sd_model_id: str = "runwayml/stable-diffusion-inpainting"

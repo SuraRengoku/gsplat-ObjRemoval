@@ -93,7 +93,7 @@ class Config:
     guidance_scale: float = 7.5
 
     # ---- training ------------------------------------------------------------
-    max_steps: int = 5_000
+    max_steps: int = 1500
     batch_size: int = 1
     sh_degree: int = 3
     sh_degree_interval: int = 1000

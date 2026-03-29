@@ -682,8 +682,8 @@ class SDSInpaintOptimizer:
         ).to(self.dtype)                                     # [B, 1, H/8, W/8]
 
         # Zero out the inpaint region in the original image, then encode.
-        # masked_img = img_bchw.to(self.dtype) * (1.0 - mask_bchw.to(self.dtype))
-        masked_img = img_bchw.to(self.dtype)
+        masked_img = img_bchw.to(self.dtype) * (1.0 - mask_bchw.to(self.dtype))
+        # masked_img = img_bchw.to(self.dtype)
         with torch.no_grad():
             masked_latent = (
                 self.vae.encode(masked_img * 2 - 1)

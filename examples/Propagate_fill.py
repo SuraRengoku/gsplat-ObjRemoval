@@ -15,6 +15,9 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import imageio.v2 as imageio
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from datasets.colmap import Dataset, Parser
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -93,7 +96,7 @@ class Config:
     guidance_scale: float = 7.5
 
     # ---- training ------------------------------------------------------------
-    max_steps: int = 1500
+    max_steps: int = 3000
     batch_size: int = 1
     sh_degree: int = 3
     sh_degree_interval: int = 1000
@@ -121,12 +124,12 @@ class Config:
     # ---- optimization stabilizers -------------------------------------------
     # Warmup steps: freeze geometry (means/scales/quats), optimize only
     # appearance + opacity so SDS first learns texture/color before moving points.
-    geom_warmup_steps: int = 1200
+    geom_warmup_steps: int = 800
     # Cap opacity during warmup to avoid early dark/opaque collapse.
     warmup_opacity_cap: float = 0.15
 
     # ---- misc ----------------------------------------------------------------
-    save_steps: List[int] = field(default_factory=lambda: [2_500, 5_000])
+    save_steps: List[int] = field(default_factory=lambda: [1000, 2000, 3000])
     tb_every: int = 100
     tb_save_image: bool = False
     seed: int = 42
@@ -756,6 +759,7 @@ class Runner:
         self.render_dir = os.path.join(cfg.result_dir, "renders")
         self.ply_dir    = os.path.join(cfg.result_dir, "ply")
         self.writer     = SummaryWriter(log_dir=os.path.join(cfg.result_dir, "tb"))
+        self.sds_loss_history = []
 
         # ---- dataset -------------------------------------------------------
         self.parser = Parser(
@@ -1079,6 +1083,7 @@ class Runner:
                 t_max=cfg.t_max,
                 guidance_scale=cfg.guidance_scale,
             )
+            self.sds_loss_history.append(sds_loss.item())
 
             # ---- boundary regularization -----------------------------------
             #   Penalise large scales so new Gaussians stay compact and do
@@ -1194,6 +1199,21 @@ class Runner:
                     canvas = colors[0].detach().cpu().numpy()
                     self.writer.add_image("train/render", canvas.transpose(2, 0, 1), step)
                 self.writer.flush()
+                
+                # Update SDS Loss curve intermittently
+                plt.figure(figsize=(10, 5))
+                plt.plot(self.sds_loss_history, label="SDS Loss", linewidth=1.0, alpha=0.4, color="tab:blue")
+                if len(self.sds_loss_history) >= 50:
+                    smoothed = np.convolve(self.sds_loss_history, np.ones(50)/50, mode='valid')
+                    shift = 50 // 2 - 1
+                    plt.plot(np.arange(shift, len(smoothed) + shift), smoothed, label="Smoothed (MA=50)", linewidth=2.0, color="tab:red")
+                plt.xlabel("Step")
+                plt.ylabel("SDS Loss")
+                plt.title("SDS Loss Progression")
+                plt.grid(True)
+                plt.legend()
+                plt.savefig(os.path.join(self.stats_dir, "sds_loss_curve.png"), bbox_inches="tight")
+                plt.close()
 
             # ---- periodic render dump -------------------------------------
             if step % 50 == 0:
@@ -1216,6 +1236,21 @@ class Runner:
                     os.path.join(self.stats_dir, f"stats_{step:05d}.json"), "w"
                 ) as f:
                     json.dump(stats, f, indent=2)
+
+                # Save a high-quality SDS Loss curve on checkpoints
+                plt.figure(figsize=(10, 5))
+                plt.plot(self.sds_loss_history, label="SDS Loss", linewidth=1.0, alpha=0.4, color="tab:blue")
+                if len(self.sds_loss_history) >= 50:
+                    smoothed = np.convolve(self.sds_loss_history, np.ones(50)/50, mode='valid')
+                    shift = 50 // 2 - 1
+                    plt.plot(np.arange(shift, len(smoothed) + shift), smoothed, label="Smoothed (MA=50)", linewidth=2.0, color="tab:red")
+                plt.xlabel("Step")
+                plt.ylabel("SDS Loss")
+                plt.title("SDS Loss Progression")
+                plt.grid(True)
+                plt.legend()
+                plt.savefig(os.path.join(self.stats_dir, "sds_loss_curve.png"), bbox_inches="tight")
+                plt.close()
 
                 # Save new Gaussians only.
                 torch.save(

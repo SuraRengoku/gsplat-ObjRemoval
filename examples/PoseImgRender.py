@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import numpy as np
 import imageio
 from tqdm import tqdm
+import concurrent.futures
 
 from gsplat.rendering import rasterization
 from datasets.colmap import Parser
@@ -66,7 +67,10 @@ def main():
 
     print(f"Rendering {len(colmap_parser.image_names)} images...")
     
-    for i in tqdm(range(len(colmap_parser.image_names))):
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    save_tasks = []
+
+    for i in tqdm(range(len(colmap_parser.image_names)), desc="Rendering"):
         cam_id = colmap_parser.camera_ids[i]
         image_name = colmap_parser.image_names[i]
         
@@ -104,8 +108,13 @@ def main():
             out_name = os.path.splitext(os.path.basename(image_name))[0] + ".png"
             out_path = os.path.join(args.output_dir, out_name)
             
-            imageio.imwrite(out_path, img_rgb_8bit)
+            save_tasks.append(executor.submit(imageio.imwrite, out_path, img_rgb_8bit))
 
+    print("Waiting for image saving to complete...")
+    for _ in tqdm(concurrent.futures.as_completed(save_tasks), total=len(save_tasks), desc="Saving"):
+        pass
+    
+    executor.shutdown()
     print("Done!")
 
 if __name__ == "__main__":

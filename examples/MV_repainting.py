@@ -11,6 +11,7 @@ import tyro
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+import concurrent.futures
 
 from diffusers import StableDiffusionInpaintPipeline
 
@@ -61,6 +62,9 @@ def main(cfg: Config):
     
     print(f"Found {len(image_paths)} images. Commencing 2D inpainting...")
     
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    save_tasks = []
+    
     for img_path in tqdm(image_paths):
         stem = img_path.stem
         
@@ -97,9 +101,14 @@ def main(cfg: Config):
             guidance_scale=cfg.guidance_scale,
         ).images[0]
         
-        # Save
-        result.save(out_dir / f"{stem}.png")
+        # Save asynchronously
+        save_tasks.append(executor.submit(result.save, out_dir / f"{stem}.png"))
         
+    print("Waiting for image saving to complete...")
+    for _ in tqdm(concurrent.futures.as_completed(save_tasks), total=len(save_tasks), desc="Saving"):
+        pass
+
+    executor.shutdown()
     print(f"All done! Results saved to {out_dir}")
 
 def _normalize_cli_underscores(argv):

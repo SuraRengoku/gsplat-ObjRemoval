@@ -80,7 +80,7 @@ class Config:
     # Hugging-Face model id for the inpainting pipeline.
     sd_model_id: str = "runwayml/stable-diffusion-inpainting"
     # Text prompt fed to the inpainting model.
-    prompt: str = "fill content in the mask area based on surrounding information"
+    prompt: str = ""
     negative_prompt: str = "artifacts, blurry, low quality"
     # Timestep sampling range expressed as a *fraction* of the scheduler's
     # total timesteps (T_max).  DreamFusion uses [0.02, 0.98]

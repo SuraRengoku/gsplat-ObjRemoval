@@ -1,4 +1,7 @@
 # type: ignore
+"""
+
+"""
 import os
 import sys
 import torch
@@ -20,7 +23,7 @@ class Config:
     # Where to save the 2D repainted images
     result_dir: str = "results/kitchen_2D_inpaints"
     # Prompt for Stable Diffusion
-    prompt: str = "background behind the object, perfectly matching the surrounding environment"
+    prompt: str = ""
     negative_prompt: str = "artifacts, blurry, low quality"
     # Checkpoint
     sd_model_id: str = "runwayml/stable-diffusion-inpainting"
@@ -88,6 +91,8 @@ def main(cfg: Config):
             negative_prompt=cfg.negative_prompt,
             image=init_image,
             mask_image=mask_image,
+            height=h,
+            width=w,
             num_inference_steps=cfg.num_inference_steps,
             guidance_scale=cfg.guidance_scale,
         ).images[0]

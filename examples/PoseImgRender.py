@@ -1,3 +1,12 @@
+"""
+Usage:
+python PoseImgRender.py 
+    --ckpt 
+    --colmap_dir [no need to direct to sparse/0]
+    --output_dir
+    --factor
+"""
+
 import argparse
 import math
 import os
@@ -28,10 +37,12 @@ def main():
     else:
         ckpt = ckpt_data
 
-    means = ckpt["means"]
-    quats = F.normalize(ckpt["quats"], p=2, dim=-1)
-    scales = torch.exp(ckpt["scales"])
-    opacities = torch.sigmoid(ckpt["opacities"])
+    means = ckpt["means"] # [N, 3]
+    # quats = F.normalize(ckpt["quats"], p=2, dim=-1) 
+    # rasterization does normalization internally 
+    quats = ckpt["quats"] # [N, 4]
+    scales = torch.exp(ckpt["scales"]) # [N, 3]
+    opacities = torch.sigmoid(ckpt["opacities"]) # [N,]
     
     # Handle colors/sh
     if "sh0" in ckpt and "shN" in ckpt:
@@ -49,7 +60,7 @@ def main():
 
     # Load cameras
     print(f"Loading COLMAP poses from {args.colmap_dir}")
-    colmap_parser = Parser(data_dir=args.colmap_dir, factor=args.factor)
+    colmap_parser = Parser(data_dir=args.colmap_dir, factor=args.factor, normalize=True)
 
     os.makedirs(args.output_dir, exist_ok=True)
 

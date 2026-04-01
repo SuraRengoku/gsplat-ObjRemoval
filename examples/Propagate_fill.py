@@ -1,4 +1,18 @@
 # type: ignore
+"""
+usage:
+python Propagate_fill.py
+    --data_dir 
+    --result_dir
+    --bg_ckpt
+    --fg_ckpt
+    --hole_mask_dir
+    --hole_mask_ext
+    --max_steps
+    --enable_strategy
+
+"""
+
 import json
 import inspect
 import math
@@ -79,6 +93,8 @@ class Config:
     # ---- SDS -----------------------------------------------------------------
     # Hugging-Face model id for the inpainting pipeline.
     sd_model_id: str = "runwayml/stable-diffusion-inpainting"
+    use_ip_adapter: bool = False
+    ip_adapter_scale: float = 1.0
     # Text prompt fed to the inpainting model.
     prompt: str = ""
     negative_prompt: str = "artifacts, blurry, low quality"
@@ -577,6 +593,8 @@ class SDSInpaintOptimizer:
         model_id: str,
         device: str,
         dtype: torch.dtype = torch.float16,
+        use_ip_adapter: bool = False,
+        ip_adapter_scale: float = 1.0,
     ) -> None:
         from diffusers import StableDiffusionInpaintPipeline
 
@@ -586,6 +604,15 @@ class SDSInpaintOptimizer:
             torch_dtype=dtype,
             safety_checker=None,
         ).to(device)
+        
+        self.use_ip_adapter = use_ip_adapter
+        if self.use_ip_adapter:
+            print("[SDS] Loading IP-Adapter into pipeline...")
+            pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name="ip-adapter_sd15.bin")
+            pipe.set_ip_adapter_scale(ip_adapter_scale)
+            self.image_encoder = pipe.image_encoder
+            self.feature_extractor = pipe.feature_extractor
+
         pipe.set_progress_bar_config(disable=True)
 
         self.vae          = pipe.vae
@@ -593,6 +620,7 @@ class SDSInpaintOptimizer:
         self.tokenizer    = pipe.tokenizer
         self.text_encoder = pipe.text_encoder
         self.scheduler    = pipe.scheduler
+        self.pipe         = pipe
         self.device       = device
         self.dtype        = dtype
 
@@ -710,10 +738,25 @@ class SDSInpaintOptimizer:
         unet_in   = unet_in.repeat(2, 1, 1, 1)                           # [2B, 9, ...]
 
         with torch.no_grad():
+            added_cond_kwargs = None
+            if getattr(self, "use_ip_adapter", False):
+                from torchvision.transforms.functional import to_pil_image
+                # Convert masked image to PIL for CLIP feature extractor
+                pil_imgs = [to_pil_image(m) for m in masked_img.cpu()]
+                ip_img_embeds = self.pipe.prepare_ip_adapter_image_embeds(
+                    ip_adapter_image=pil_imgs,
+                    ip_adapter_image_embeds=None,
+                    device=self.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True,
+                )
+                added_cond_kwargs = {"image_embeds": ip_img_embeds}
+
             noise_pred = self.unet(
                 unet_in,
                 t.repeat(2),
                 encoder_hidden_states=text_in,
+                added_cond_kwargs=added_cond_kwargs,
             ).sample  # [2B, 4, H/8, W/8]
 
         noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
@@ -844,6 +887,8 @@ class Runner:
         self.sds = SDSInpaintOptimizer(
             model_id=cfg.sd_model_id,
             device=device,
+            use_ip_adapter=getattr(cfg, "use_ip_adapter", False),
+            ip_adapter_scale=getattr(cfg, "ip_adapter_scale", 1.0),
         )
         # Pre-encode text — constant throughout training.
         self.text_embeds, self.uncond_embeds = self.sds.get_text_embeddings(

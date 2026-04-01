@@ -89,6 +89,13 @@ def main(cfg: Config):
         init_image = init_image.resize((w, h))
         mask_image = mask_image.resize((w, h), Image.Resampling.NEAREST)
         
+        import cv2
+        mask_array = np.array(mask_image)
+        # Dilate mask to ensure residual artifacts from Gaussian splatting are fully covered
+        kernel = np.ones((15, 15), np.uint8)
+        mask_array = cv2.dilate(mask_array, kernel, iterations=1)
+        mask_image = Image.fromarray(mask_array)
+
         # Run inference
         result = pipeline(
             prompt=cfg.prompt,

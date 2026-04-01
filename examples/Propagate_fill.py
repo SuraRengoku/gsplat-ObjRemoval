@@ -793,6 +793,7 @@ class Runner:
         set_random_seed(cfg.seed)
         self.cfg    = cfg
         self.device = device
+        self._warned_missing_mask = False
 
         # ---- output directories ------------------------------------------
         for subdir in ("ckpts", "stats", "renders", "ply"):
@@ -908,16 +909,88 @@ class Runner:
         })
 
     def _get_mask(self, parser_index: int, height: int, width: int) -> Tensor:
-        """Return float mask [1, H, W] (1 = hole).  Falls back to full image."""
+        """Return float mask [1, H, W] (1 = hole). Missing mask -> zero mask."""
         raw = self.hole_masks.get(parser_index, None)
         if raw is None:
-            return torch.ones(1, height, width, device=self.device)
+            if not self._warned_missing_mask:
+                print(
+                    "[MASK] WARNING: missing mask found. "
+                    "Using zero mask for that view (skip update)."
+                )
+                self._warned_missing_mask = True
+            return torch.zeros(1, height, width, device=self.device)
         mask = raw.float().unsqueeze(0)
         if mask.shape[-2:] != (height, width):
             mask = F.interpolate(
                 mask.unsqueeze(0), size=(height, width), mode="nearest"
             ).squeeze(0)
         return mask.to(self.device)
+
+    @torch.no_grad()
+    def _new_gs_in_hole_current_view(
+        self,
+        parser_index: int,
+        camtoworld: Tensor,
+        K: Tensor,
+        height: int,
+        width: int,
+    ) -> Tensor:
+        """Return bool [N_new]: projected new Gaussian centers inside current hole mask."""
+        raw = self.hole_masks.get(parser_index, None)
+        n = self.new_splats["means"].shape[0]
+        if raw is None:
+            return torch.zeros(n, dtype=torch.bool, device=self.device)
+
+        mask = raw.float()
+        if mask.shape != (height, width):
+            mask = F.interpolate(mask[None, None], size=(height, width), mode="nearest")[0, 0]
+        mask = mask > 0.5
+
+        means = self.new_splats["means"].detach()
+        worldtocam = torch.linalg.inv(camtoworld)[:3, :]
+        cam = means @ worldtocam[:, :3].T + worldtocam[:, 3]
+        z = cam[:, 2]
+        valid_z = z > 1e-6
+
+        x = cam[:, 0] / torch.clamp_min(z, 1e-6)
+        y = cam[:, 1] / torch.clamp_min(z, 1e-6)
+        u = K[0, 0] * x + K[0, 2]
+        v = K[1, 1] * y + K[1, 2]
+
+        inside = valid_z & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+        keep = torch.zeros(n, dtype=torch.bool, device=self.device)
+        if inside.any():
+            idx = torch.nonzero(inside, as_tuple=False).squeeze(1)
+            ui = u[inside].long()
+            vi = v[inside].long()
+            keep[idx] = mask[vi, ui]
+        return keep
+
+    def _mask_new_grads_to_hole(
+        self,
+        parser_index: int,
+        camtoworld: Tensor,
+        K: Tensor,
+        height: int,
+        width: int,
+    ) -> None:
+        """Zero grad for new GSs whose projected centers are outside current hole mask."""
+        keep = self._new_gs_in_hole_current_view(
+            parser_index=parser_index,
+            camtoworld=camtoworld,
+            K=K,
+            height=height,
+            width=width,
+        ).float()
+
+        for key in ("means", "scales", "quats", "opacities", "sh0", "shN"):
+            grad = self.new_splats[key].grad
+            if grad is None:
+                continue
+            mask = keep
+            while mask.ndim < grad.ndim:
+                mask = mask.unsqueeze(-1)
+            grad.mul_(mask)
 
     def _rebuild_new_splats_from_keep_mask(self, keep_mask: Tensor) -> None:
         """Keep a subset of new splats and rebuild optimizers/strategy state."""
@@ -1179,6 +1252,14 @@ class Runner:
 
             total_loss = sds_loss + reg_loss + opacity_loss
             total_loss.backward()
+
+            self._mask_new_grads_to_hole(
+                parser_index=parser_index,
+                camtoworld=camtoworlds[0],
+                K=Ks[0],
+                height=height,
+                width=width,
+            )
 
             # Geometry warmup: do not move/split shape too early under noisy SDS.
             if step < cfg.geom_warmup_steps:

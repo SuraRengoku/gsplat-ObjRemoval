@@ -94,9 +94,9 @@ class Config:
     # Hugging-Face model id for the inpainting pipeline.
     sd_model_id: str = "runwayml/stable-diffusion-inpainting"
     use_ip_adapter: bool = False
-    ip_adapter_scale: float = 1.0
+    ip_adapter_scale: float = 0.8
     # Text prompt fed to the inpainting model.
-    prompt: str = ""
+    prompt: str = "seamless background, high quality"
     negative_prompt: str = "artifacts, blurry, low quality"
     # Timestep sampling range expressed as a *fraction* of the scheduler's
     # total timesteps (T_max).  DreamFusion uses [0.02, 0.98]
@@ -109,7 +109,7 @@ class Config:
     # VAE latent scale factor (SD default 0.18215).
     vae_scale_factor: float = 0.18215
     # Classifier-free guidance scale.
-    guidance_scale: float = 7.5
+    guidance_scale: float = 5.0
 
     # ---- training ------------------------------------------------------------
     max_steps: int = 3000

@@ -71,6 +71,10 @@ class Config:
     hole_mask_dir: str = ""
     # Preferred mask format when both exist for one stem.
     hole_mask_ext: Literal["auto", "npy", "png"] = "auto"
+    # Dilation radius (pixels) applied to hole masks at training time.
+    # Expands the inpaint supervision region beyond the raw mask boundary.
+    # 0 = no dilation.
+    mask_dilation_radius: int = 15
 
     # ---- new Gaussians -------------------------------------------------------
     # Number of new Gaussians to place inside the hole.
@@ -481,6 +485,33 @@ def create_new_splat_optimizers(
 
 
 # ---------------------------------------------------------------------------
+# Mask utilities
+# ---------------------------------------------------------------------------
+
+def dilate_mask(mask: Tensor, radius: int) -> Tensor:
+    """
+    Binary dilation of a float mask via max-pooling.
+
+    Args:
+        mask:   Float tensor [H, W] with values in {0, 1}.
+        radius: Dilation radius in pixels.  0 = identity.
+
+    Returns:
+        Dilated float tensor [H, W].
+    """
+    if radius <= 0:
+        return mask
+    k = 2 * radius + 1
+    dilated = F.max_pool2d(
+        mask.float().unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+        kernel_size=k,
+        stride=1,
+        padding=radius,
+    )  # [1, 1, H, W]
+    return (dilated.squeeze(0).squeeze(0) > 0.5).float()
+
+
+# ---------------------------------------------------------------------------
 # Per-view hole-mask loading
 # ---------------------------------------------------------------------------
 
@@ -772,11 +803,11 @@ class SDSInpaintOptimizer:
         #
         #   Weight w(t) = (1 − ᾱ_t) follows the original SDS formulation
         #   (Poole et al., 2022).  SNR-weighted variants can be substituted.
-        w       = (1.0 - alpha_t)                      # [B, 1, 1, 1]
-        sds_grad = w * (noise_pred_guided.float() - noise.float())  # [B, 4, H/8, W/8]
+        w            = (1.0 - alpha_t)                                        # [B, 1, 1, 1]
+        sds_grad_full = w * (noise_pred_guided.float() - noise.float())        # [B, 4, H/8, W/8]
 
         # Zero gradient outside the hole region.
-        sds_grad = sds_grad * mask_latent.float()
+        sds_grad = sds_grad_full * mask_latent.float()
 
         # ---- 7. Stop-gradient pseudo-loss ----------------------------------
         #   Produces  ∇_z L = d_SDS  without computing second-order gradients
@@ -785,7 +816,9 @@ class SDSInpaintOptimizer:
 
         if return_pixel_map:
             with torch.no_grad():
-                pmap = torch.linalg.norm(sds_grad.float(), dim=1, keepdim=True)  # [B,1,lH,lW]
+                # Return the full (unmasked) gradient magnitude so callers can
+                # apply their own masking for region-specific visualisation.
+                pmap = torch.linalg.norm(sds_grad_full, dim=1, keepdim=True)  # [B,1,lH,lW]
                 pmap = F.interpolate(pmap, size=(H, W), mode="bilinear", align_corners=False)
                 pmap = pmap.squeeze(1)  # [B, H, W]
             return loss, pmap
@@ -797,14 +830,15 @@ class SDSInpaintOptimizer:
 # ---------------------------------------------------------------------------
 
 def _save_debug_sds(
-    loss_map: Tensor,  # [H, W] float — per-pixel SDS gradient magnitude
-    mask: Tensor,      # [H, W] float in [0, 1]
+    loss_map: Tensor,  # [H, W] float — full (unmasked) per-pixel SDS gradient magnitude
+    mask: Tensor,      # [H, W] float in [0, 1] — dilated hole mask
     path: str,
 ) -> None:
     """
-    Save a side-by-side diagnostic PNG:
-      LEFT:  SDS gradient magnitude heatmap (inferno colormap; brighter = stronger signal)
-      RIGHT: binary hole mask used in this step
+    Save a three-panel diagnostic PNG:
+      LEFT:   Full-image SDS gradient magnitude heatmap (inferno; brighter = stronger signal)
+      CENTER: Dilated hole mask used as supervision region
+      RIGHT:  SDS gradient magnitude inside the mask region only
     """
     loss_np = loss_map.detach().cpu().float().numpy()
     mask_np = mask.detach().cpu().float().numpy()
@@ -812,10 +846,17 @@ def _save_debug_sds(
     vmax = loss_np.max()
     loss_norm = loss_np / vmax if vmax > 0 else loss_np
 
-    cmap     = plt.get_cmap("inferno")
-    heatmap  = (cmap(loss_norm)[..., :3] * 255).astype(np.uint8)
-    mask_vis = (np.stack([mask_np] * 3, axis=-1) * 255).astype(np.uint8)
-    imageio.imwrite(path, np.concatenate([heatmap, mask_vis], axis=1))
+    cmap = plt.get_cmap("inferno")
+
+    # LEFT: full-image SDS heatmap
+    left   = (cmap(loss_norm)[..., :3] * 255).astype(np.uint8)
+    # CENTER: dilated mask
+    center = (np.stack([mask_np] * 3, axis=-1) * 255).astype(np.uint8)
+    # RIGHT: SDS inside the dilated mask only
+    region_norm = loss_norm * mask_np
+    right  = (cmap(region_norm)[..., :3] * 255).astype(np.uint8)
+
+    imageio.imwrite(path, np.concatenate([left, center, right], axis=1))
 
 
 # ---------------------------------------------------------------------------
@@ -944,7 +985,7 @@ class Runner:
         })
 
     def _get_mask(self, parser_index: int, height: int, width: int) -> Tensor:
-        """Return float mask [1, H, W] (1 = hole). Missing mask -> zero mask."""
+        """Return dilated float mask [1, H, W] (1 = hole). Missing mask -> zero mask."""
         raw = self.hole_masks.get(parser_index, None)
         if raw is None:
             if not self._warned_missing_mask:
@@ -959,6 +1000,9 @@ class Runner:
             mask = F.interpolate(
                 mask.unsqueeze(0), size=(height, width), mode="nearest"
             ).squeeze(0)
+        # Apply dilation to expand supervision region.
+        if self.cfg.mask_dilation_radius > 0:
+            mask = dilate_mask(mask.squeeze(0), self.cfg.mask_dilation_radius).unsqueeze(0)
         return mask.to(self.device)
 
     @torch.no_grad()

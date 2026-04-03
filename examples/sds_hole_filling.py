@@ -25,6 +25,10 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")  # headless backend — no display required
+import matplotlib.pyplot as plt
+
 import imageio.v2 as imageio
 import numpy as np
 import torch
@@ -40,7 +44,7 @@ from gsplat.rendering import rasterization
 
 # Optional: diffusers for real SD. Falls back to mock if unavailable.
 try:
-    from diffusers import DDPMScheduler, StableDiffusionPipeline
+    from diffusers import DDPMScheduler, StableDiffusionInpaintPipeline
 
     _DIFFUSERS_AVAILABLE = True
 except ImportError:
@@ -339,24 +343,28 @@ def render_batch(
 
 class DiffusionWrapper(nn.Module):
     """
-    Thin wrapper around Stable Diffusion's UNet for SDS.
+    Wrapper around Stable Diffusion Inpainting UNet for mask-aware SDS.
 
-    If *diffusers* is unavailable (or model_id is None) a mock predictor is
-    used so the training loop still runs end-to-end.
+    Uses ``runwayml/stable-diffusion-inpainting`` (or any compatible inpainting
+    checkpoint).  The inpainting UNet has **9 input channels**::
+
+        [z_t (4)] + [mask_down (1)] + [masked_image_latent (4)]
+
+    This lets the model see exactly where the hole is and what the surrounding
+    context looks like, giving much better boundary fusion than plain SD v1.5.
+
+    Falls back to a lightweight mock (random noise prediction) when *diffusers*
+    is unavailable or *model_id* is None.
 
     Interface::
 
-        noise_pred = wrapper.predict_noise(x_t, t, prompt_embeds)
-
-    where
-        x_t           - [B, 4, H//8, W//8]  latents (VAE-space)
-        t             - scalar or [B] int64 timestep
-        prompt_embeds - [B, seq, 768]        text embeddings
+        noise_pred = wrapper.predict_noise(x_t, t, prompt_embeds,
+                                           mask_latent, masked_image_latent)
     """
 
     def __init__(
         self,
-        model_id: Optional[str] = "runwayml/stable-diffusion-v1-5",
+        model_id: Optional[str] = "runwayml/stable-diffusion-inpainting",
         device: torch.device = torch.device("cpu"),
         use_mock: bool = False,
     ) -> None:
@@ -365,16 +373,18 @@ class DiffusionWrapper(nn.Module):
         self.use_mock = use_mock or (not _DIFFUSERS_AVAILABLE) or (model_id is None)
 
         if not self.use_mock:
-            pipe = StableDiffusionPipeline.from_pretrained(
+            pipe = StableDiffusionInpaintPipeline.from_pretrained(
                 model_id,
-                torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+                dtype=torch.float16 if device.type == "cuda" else torch.float32,
+                safety_checker=None,
+                requires_safety_checker=False,
             ).to(device)
             self.unet      = pipe.unet.eval()
             self.vae       = pipe.vae.eval()
             self.tokenizer = pipe.tokenizer
             self.text_enc  = pipe.text_encoder.eval()
             self.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
-            # Freeze SD weights — only 3DGS params are optimised
+            # Freeze all SD weights — only 3DGS params are optimised
             for p in self.unet.parameters():
                 p.requires_grad_(False)
             for p in self.vae.parameters():
@@ -382,7 +392,10 @@ class DiffusionWrapper(nn.Module):
             for p in self.text_enc.parameters():
                 p.requires_grad_(False)
             self.num_train_timesteps = self.scheduler.config.num_train_timesteps
-            print(f"[Diffusion] Loaded SD model '{model_id}'.")
+            # Store the actual dtype the models were loaded with (dtype kwarg may be
+            # silently ignored by some pipeline versions, so read it from the weights)
+            self.model_dtype = next(self.vae.parameters()).dtype
+            print(f"[Diffusion] Loaded inpainting model '{model_id}' (dtype={self.model_dtype}).")
         else:
             self.num_train_timesteps = 1000
             print("[Diffusion] Using mock noise predictor (no SD model loaded).")
@@ -411,7 +424,7 @@ class DiffusionWrapper(nn.Module):
             B, _, H, W = rgb.shape
             return torch.randn(B, 4, H // 8, W // 8, device=self.device)
         x = rgb * 2.0 - 1.0  # → [-1, 1]
-        return self.vae.encode(x.to(self.device, dtype=torch.float16)).latent_dist.sample() * 0.18215
+        return self.vae.encode(x.to(self.device, dtype=self.model_dtype)).latent_dist.sample() * 0.18215
 
     # ------------------------------------------------------------------
     def add_noise(self, latents: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
@@ -426,7 +439,7 @@ class DiffusionWrapper(nn.Module):
             return noisy, noise
 
         alphas_cumprod = self.scheduler.alphas_cumprod.to(latents.device)
-        sqrt_alpha = alphas_cumprod[t].sqrt().view(-1, 1, 1, 1)
+        sqrt_alpha     = alphas_cumprod[t].sqrt().view(-1, 1, 1, 1)
         sqrt_one_minus = (1 - alphas_cumprod[t]).sqrt().view(-1, 1, 1, 1)
         noisy = sqrt_alpha * latents + sqrt_one_minus * noise
         return noisy, noise
@@ -437,24 +450,37 @@ class DiffusionWrapper(nn.Module):
         x_t: Tensor,
         t: Tensor,
         prompt_embeds: Tensor,
+        mask_latent: Optional[Tensor] = None,
+        masked_image_latent: Optional[Tensor] = None,
     ) -> Tensor:
         """
-        Run UNet forward pass.
+        Run the inpainting UNet forward pass.
 
         Args:
-            x_t:           [B, 4, H//8, W//8]  noisy latents
-            t:             [B] int64
-            prompt_embeds: [B, seq, hidden]
+            x_t:                  [B, 4, Hl, Wl]  noisy latents
+            t:                    [B] int64
+            prompt_embeds:        [B, seq, hidden]
+            mask_latent:          [B, 1, Hl, Wl]  downsampled hole mask (required for inpainting)
+            masked_image_latent:  [B, 4, Hl, Wl]  VAE latent of image*(1-mask) (required for inpainting)
 
         Returns:
-            eps_pred:      [B, 4, H//8, W//8]  predicted noise
+            eps_pred: [B, 4, Hl, Wl]  predicted noise
         """
         if self.use_mock:
             return torch.randn_like(x_t)
 
-        dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        dtype = self.model_dtype
+
+        # Inpainting UNet: concatenate [z_t | mask | masked_image_latent] → 9 channels
+        assert mask_latent is not None and masked_image_latent is not None, (
+            "mask_latent and masked_image_latent are required for inpainting UNet"
+        )
+        unet_input = torch.cat(
+            [x_t, mask_latent, masked_image_latent], dim=1
+        )  # [B, 9, Hl, Wl]
+
         return self.unet(
-            x_t.to(dtype),
+            unet_input.to(dtype),
             t.to(self.device),
             encoder_hidden_states=prompt_embeds.to(dtype),
         ).sample
@@ -473,17 +499,18 @@ def sds_loss(
     t_range: Tuple[int, int] = (50, 950),
 ) -> Tensor:
     """
-    Mask-aware SDS loss:
+    Inpainting-conditioned SDS loss:
 
         L_sds = || (ε_pred - ε) * mask_latent ||²
 
-    Steps:
-      1. Encode rendered RGB → latent z_0
-      2. Sample t, add noise → z_t
-      3. Predict ε_θ from z_t
-      4. Compute per-latent-pixel masked L2
+    The inpainting UNet receives three conditioning signals:
+      - z_t:                 noisy latent of the full rendered image
+      - mask_latent:         downsampled binary hole mask  (÷8)
+      - masked_image_latent: VAE latent of image * (1 - mask), i.e. the
+                             known background with the hole zeroed out
 
-    The latent-space mask is obtained by down-sampling the pixel mask (÷8).
+    This lets the UNet see exactly where the hole is and what surrounds it,
+    producing gradients that are much more spatially aware than plain SDS.
     """
     # Ensure [B, H, W, 3] and [B, H, W]
     if rgb_rendered.dim() == 3:
@@ -493,36 +520,45 @@ def sds_loss(
     B, H, W, _ = rgb_rendered.shape
 
     # [B, 3, H, W] for VAE
-    rgb_b = rgb_rendered.permute(0, 2, 3, 1).contiguous() if rgb_rendered.shape[-1] == 3 else rgb_rendered
-    # Correct: rendered is [B, H, W, 3] → permute to [B, 3, H, W]
-    rgb_b = rgb_rendered.permute(0, 3, 1, 2).contiguous()
+    rgb_b = rgb_rendered.permute(0, 3, 1, 2).contiguous()  # [B, 3, H, W]
 
     with torch.no_grad():
-        latents = diffusion.encode_image(rgb_b)                # [B, 4, Hl, Wl]
+        latents = diffusion.encode_image(rgb_b)             # [B, 4, Hl, Wl]
 
     Hl, Wl = latents.shape[2], latents.shape[3]
 
-    # Down-sample mask to latent resolution
+    # Downsampled mask for latent space conditioning  [B, 1, Hl, Wl]
     mask_latent = F.interpolate(
-        mask.unsqueeze(1).float(),  # [B, 1, H, W]
+        mask.unsqueeze(1).float(),
         size=(Hl, Wl),
         mode="bilinear",
         align_corners=False,
-    )  # [B, 1, Hl, Wl]
+    )
     mask_latent = (mask_latent > 0.5).float()
+
+    # Masked image: zero the hole region, encode to latent  [B, 4, Hl, Wl]
+    # The inpainting UNet uses this to understand the surrounding context.
+    with torch.no_grad():
+        bg_mask_pixel = (1.0 - mask).unsqueeze(1)           # [B, 1, H, W]
+        masked_rgb    = rgb_b * bg_mask_pixel                # hole pixels → 0
+        masked_image_latent = diffusion.encode_image(masked_rgb)  # [B, 4, Hl, Wl]
 
     # Sample random timestep
     t = torch.randint(t_range[0], t_range[1], (B,), device=latents.device)
 
     with torch.no_grad():
         noisy_latents, noise_gt = diffusion.add_noise(latents, t)
-        embeds = prompt_embeds.expand(B, -1, -1)
-        noise_pred = diffusion.predict_noise(noisy_latents, t, embeds)
+        embeds     = prompt_embeds.expand(B, -1, -1)
+        noise_pred = diffusion.predict_noise(
+            noisy_latents,
+            t,
+            embeds,
+            mask_latent=mask_latent,
+            masked_image_latent=masked_image_latent,
+        )
 
-    # SDS gradient: treat (noise_pred - noise_gt) as a fixed gradient signal
-    # We propagate through the renderer by using the rendered image directly.
-    # Standard SDS: compute L2 in latent space, masked to hole region.
-    diff = noise_pred - noise_gt  # [B, 4, Hl, Wl]   (detached from SD)
+    # SDS: use (ε_pred − ε) as a fixed gradient signal, masked to hole region
+    diff = noise_pred - noise_gt                            # [B, 4, Hl, Wl]
     loss = (diff.detach() * mask_latent).pow(2).mean()
     return loss
 
@@ -598,7 +634,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt",       type=str, required=True,  help="3DGS checkpoint .pt")
     p.add_argument("--result_dir", type=str, default="results/sds_fill")
     p.add_argument("--prompt",     type=str, default="a clean background scene, high quality")
-    p.add_argument("--sd_model",   type=str, default=None,   help="HuggingFace SD model ID (None = mock)")
+    p.add_argument("--sd_model",   type=str, default=None,   help="HuggingFace SD model ID (None = mock). Recommended: runwayml/stable-diffusion-inpainting")
     p.add_argument("--max_steps",  type=int, default=5_000)
     p.add_argument("--batch_size", type=int, default=2,      help="Views per iteration (>=2 for MV loss)")
     p.add_argument("--data_factor",type=int, default=2)
@@ -610,9 +646,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_mv",    type=float, default=0.1)
     p.add_argument("--t_min", type=int, default=50,  help="Min diffusion timestep for SDS")
     p.add_argument("--t_max", type=int, default=950, help="Max diffusion timestep for SDS")
-    p.add_argument("--log_every",  type=int, default=100)
-    p.add_argument("--save_every", type=int, default=1_000)
-    p.add_argument("--device",     type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--log_every",    type=int, default=100)
+    p.add_argument("--render_every",  type=int, default=50,   help="Save a preview render to renders/ every N steps")
+    p.add_argument("--save_every",    type=int, default=1_000)
+    p.add_argument("--device",        type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
 
@@ -622,12 +659,43 @@ def save_image(path: str, tensor: Tensor) -> None:
     imageio.imwrite(path, img)
 
 
+def _plot_losses(
+    history: Dict[str, List[float]],
+    steps: List[int],
+    stats_dir: str,
+) -> None:
+    """Save a loss-curve PNG to *stats_dir*.  Called after every log step."""
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+    configs = [
+        ("total", "Total Loss",            "tab:blue"),
+        ("sds",   "SDS Loss",              "tab:orange"),
+        ("keep",  "Keep Loss",             "tab:green"),
+        ("mv",    "Multi-View Consistency", "tab:red"),
+    ]
+    for ax, (key, title, color) in zip(axes.flat, configs):
+        vals = history.get(key, [])
+        if vals:
+            ax.plot(steps[: len(vals)], vals, color=color, linewidth=1.2)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("step", fontsize=8)
+        ax.grid(True, linestyle="--", alpha=0.5)
+    fig.tight_layout()
+    fig.savefig(os.path.join(stats_dir, "losses.png"), dpi=120)
+    plt.close(fig)
+
+
 def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     os.makedirs(args.result_dir, exist_ok=True)
     os.makedirs(os.path.join(args.result_dir, "renders"), exist_ok=True)
+    stats_dir = os.path.join(args.result_dir, "stats")
+    os.makedirs(stats_dir, exist_ok=True)
 
     writer = SummaryWriter(log_dir=os.path.join(args.result_dir, "tb"))
+
+    # Loss history for matplotlib plots
+    loss_history: Dict[str, List[float]] = {"total": [], "sds": [], "keep": [], "mv": []}
+    loss_steps:   List[int] = []
 
     # ---- Dataset -----------------------------------------------------------
     dataset = ColmapMaskDataset(
@@ -730,22 +798,32 @@ def train(args: argparse.Namespace) -> None:
             writer.add_scalar("loss/keep",   loss_keep_total.item(),step)
             writer.add_scalar("loss/mv",     loss_mv.item(),        step)
 
-        # ---- Visualisation -------------------------------------------------
-        if step % args.save_every == 0 or step == args.max_steps:
+            # Append to history and redraw loss plots
+            loss_history["total"].append(loss.item())
+            loss_history["sds"].append(loss_sds_total.item())
+            loss_history["keep"].append(loss_keep_total.item())
+            loss_history["mv"].append(loss_mv.item())
+            loss_steps.append(step)
+            _plot_losses(loss_history, loss_steps, stats_dir)
+
+        # ---- Periodic preview render (every render_every steps) ------------
+        if step % args.render_every == 0:
             with torch.no_grad():
-                sample_view = dataset.sample_batch(1)[0]
-                vis = render(
+                preview_view = dataset.sample_batch(1)[0]
+                preview_rgb  = render(
                     scene,
-                    sample_view["camtoworld"],
-                    sample_view["K"],
-                    sample_view["width"],
-                    sample_view["height"],
+                    preview_view["camtoworld"],
+                    preview_view["K"],
+                    preview_view["width"],
+                    preview_view["height"],
                 )
             save_image(
                 os.path.join(args.result_dir, "renders", f"step_{step:06d}.png"),
-                vis,
+                preview_rgb,
             )
 
+        # ---- Checkpoint + full visualisation -------------------------------
+        if step % args.save_every == 0 or step == args.max_steps:
             # Save checkpoint
             ckpt_path = os.path.join(args.result_dir, f"ckpt_step_{step:06d}.pt")
             torch.save(

@@ -663,7 +663,8 @@ class SDSInpaintOptimizer:
         t_min: float,
         t_max: float,
         guidance_scale: float = 7.5,
-    ) -> Tensor:
+        return_pixel_map: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
         Compute the SDS loss for one rendered view.
 
@@ -781,7 +782,40 @@ class SDSInpaintOptimizer:
         #   Produces  ∇_z L = d_SDS  without computing second-order gradients
         #   through the UNet (which is frozen and in no-grad mode).
         loss = (sds_grad.detach() * z).sum()
+
+        if return_pixel_map:
+            with torch.no_grad():
+                pmap = torch.linalg.norm(sds_grad.float(), dim=1, keepdim=True)  # [B,1,lH,lW]
+                pmap = F.interpolate(pmap, size=(H, W), mode="bilinear", align_corners=False)
+                pmap = pmap.squeeze(1)  # [B, H, W]
+            return loss, pmap
         return loss
+
+
+# ---------------------------------------------------------------------------
+# Debug helpers
+# ---------------------------------------------------------------------------
+
+def _save_debug_sds(
+    loss_map: Tensor,  # [H, W] float — per-pixel SDS gradient magnitude
+    mask: Tensor,      # [H, W] float in [0, 1]
+    path: str,
+) -> None:
+    """
+    Save a side-by-side diagnostic PNG:
+      LEFT:  SDS gradient magnitude heatmap (inferno colormap; brighter = stronger signal)
+      RIGHT: binary hole mask used in this step
+    """
+    loss_np = loss_map.detach().cpu().float().numpy()
+    mask_np = mask.detach().cpu().float().numpy()
+
+    vmax = loss_np.max()
+    loss_norm = loss_np / vmax if vmax > 0 else loss_np
+
+    cmap     = plt.get_cmap("inferno")
+    heatmap  = (cmap(loss_norm)[..., :3] * 255).astype(np.uint8)
+    mask_vis = (np.stack([mask_np] * 3, axis=-1) * 255).astype(np.uint8)
+    imageio.imwrite(path, np.concatenate([heatmap, mask_vis], axis=1))
 
 
 # ---------------------------------------------------------------------------
@@ -796,12 +830,13 @@ class Runner:
         self._warned_missing_mask = False
 
         # ---- output directories ------------------------------------------
-        for subdir in ("ckpts", "stats", "renders", "ply"):
+        for subdir in ("ckpts", "stats", "renders", "ply", "debug"):
             os.makedirs(os.path.join(cfg.result_dir, subdir), exist_ok=True)
         self.ckpt_dir   = os.path.join(cfg.result_dir, "ckpts")
         self.stats_dir  = os.path.join(cfg.result_dir, "stats")
         self.render_dir = os.path.join(cfg.result_dir, "renders")
         self.ply_dir    = os.path.join(cfg.result_dir, "ply")
+        self.debug_dir  = os.path.join(cfg.result_dir, "debug")
         self.writer     = SummaryWriter(log_dir=os.path.join(cfg.result_dir, "tb"))
         self.sds_loss_history = []
 
@@ -1341,13 +1376,32 @@ class Runner:
                 plt.savefig(os.path.join(self.stats_dir, "sds_loss_curve.png"), bbox_inches="tight")
                 plt.close()
 
-            # ---- periodic render dump -------------------------------------
+            # ---- periodic render dump + SDS debug heatmap -----------------
             if step % 50 == 0:
                 render_np = colors[0].detach().clamp(0.0, 1.0).cpu().numpy()
                 render_u8 = (render_np * 255.0).astype(np.uint8)
                 imageio.imwrite(
                     os.path.join(self.render_dir, f"render_{step:05d}_img{parser_index:04d}.png"),
                     render_u8,
+                )
+
+                # SDS gradient magnitude heatmap + mask side-by-side
+                with torch.no_grad():
+                    _, sds_pixel_map = self.sds.sds_loss(
+                        rendered=colors.detach(),
+                        mask=mask_hw,
+                        text_embeds=self.text_embeds,
+                        uncond_embeds=self.uncond_embeds,
+                        vae_scale=cfg.vae_scale_factor,
+                        t_min=cfg.t_min,
+                        t_max=cfg.t_max,
+                        guidance_scale=cfg.guidance_scale,
+                        return_pixel_map=True,
+                    )
+                _save_debug_sds(
+                    sds_pixel_map[0],  # [H, W]
+                    mask_hw[0],         # [H, W]
+                    os.path.join(self.debug_dir, f"debug_{step:05d}_img{parser_index:04d}.png"),
                 )
 
             # ---- checkpoint ------------------------------------------------
